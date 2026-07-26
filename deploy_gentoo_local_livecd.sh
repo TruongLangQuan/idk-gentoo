@@ -24,39 +24,65 @@ PART_EFI="${DISK}p1"
 PART_SWAP="${DISK}p2"
 PART_ROOT="${DISK}p3"
 
+# Root/user passwords: never hardcode these in the script. Pull from the
+# environment if already set (useful for unattended/CI-style runs), otherwise
+# prompt interactively. These get exported so the chroot'd shell can see them.
+if [ -z "${ROOT_PW:-}" ]; then
+    read -r -s -p "Set password for root: " ROOT_PW; echo
+fi
+if [ -z "${USER_PW:-}" ]; then
+    read -r -s -p "Set password for truonglangquan: " USER_PW; echo
+fi
+export ROOT_PW USER_PW
+
 # Verify physical NVMe drive exists on laptop
 if [ ! -b "${DISK}" ]; then
     echo "[-] ERROR: Device ${DISK} not found! Run 'lsblk' to check your drive name."
     exit 1
 fi
 
-echo "[1/9] Deactivating swaps & unmounting existing partitions on ${DISK}..."
-swapoff ${DISK}* 2>/dev/null || true
-swapoff -a 2>/dev/null || true
+# Resumability guard: if a previous run of this exact script already
+# partitioned and formatted the disk (recognized via the ROOT label we set
+# below), skip straight to mounting instead of wiping it again. This lets you
+# re-run the script after a failure further down without losing everything.
+EXISTING_ROOT_LABEL=$(blkid -s LABEL -o value "${PART_ROOT}" 2>/dev/null || true)
 
-umount -R /mnt/gentoo 2>/dev/null || true
-umount -R ${DISK}* 2>/dev/null || true
+if [ "${EXISTING_ROOT_LABEL}" = "ROOT" ]; then
+    echo "[1/9] Existing ROOT partition detected on ${PART_ROOT} — skipping partition/format, remounting as-is..."
+    swapon -v "${PART_SWAP}" 2>/dev/null || true
+    mkdir -p /mnt/gentoo
+    mountpoint -q /mnt/gentoo || mount "${PART_ROOT}" /mnt/gentoo
+    mkdir -p /mnt/gentoo/boot/efi
+    mountpoint -q /mnt/gentoo/boot/efi || mount "${PART_EFI}" /mnt/gentoo/boot/efi
+else
+    echo "[1/9] Deactivating swaps & unmounting existing partitions on ${DISK}..."
+    swapoff ${DISK}* 2>/dev/null || true
+    swapoff -a 2>/dev/null || true
 
-echo "[+] Creating GPT Partition Table (1G EFI, 64G Swap, Root rest)..."
-parted -s "${DISK}" mklabel gpt
-parted -s "${DISK}" mkpart "ESP" fat32 1MiB 1025MiB
-parted -s "${DISK}" set 1 esp on
-parted -s "${DISK}" mkpart "SWAP" linux-swap 1025MiB 65537MiB
-parted -s "${DISK}" mkpart "ROOT" ext4 65537MiB 100%
+    umount -R /mnt/gentoo 2>/dev/null || true
+    umount -R ${DISK}* 2>/dev/null || true
 
-udevadm settle || sleep 2
+    echo "[+] Creating GPT Partition Table (1G EFI, 64G Swap, Root rest)..."
+    parted -s "${DISK}" mklabel gpt
+    parted -s "${DISK}" mkpart "ESP" fat32 1MiB 1025MiB
+    parted -s "${DISK}" set 1 esp on
+    parted -s "${DISK}" mkpart "SWAP" linux-swap 1025MiB 65537MiB
+    parted -s "${DISK}" mkpart "ROOT" ext4 65537MiB 100%
 
-echo "[+] Formatting Partitions (${PART_EFI}, ${PART_SWAP}, ${PART_ROOT})..."
-mkfs.vfat -F 32 -n "EFI" "${PART_EFI}"
-mkswap -L "SWAP" "${PART_SWAP}"
-swapon -v "${PART_SWAP}" 2>/dev/null || true
-mkfs.ext4 -F -L "ROOT" "${PART_ROOT}"
+    udevadm settle || sleep 2
 
-echo "[+] Mounting Target Filesystems into /mnt/gentoo..."
-mkdir -p /mnt/gentoo
-mount "${PART_ROOT}" /mnt/gentoo
-mkdir -p /mnt/gentoo/boot/efi
-mount "${PART_EFI}" /mnt/gentoo/boot/efi
+    echo "[+] Formatting Partitions (${PART_EFI}, ${PART_SWAP}, ${PART_ROOT})..."
+    mkfs.vfat -F 32 -n "EFI" "${PART_EFI}"
+    mkswap -L "SWAP" "${PART_SWAP}"
+    swapon -v "${PART_SWAP}" 2>/dev/null || true
+    mkfs.ext4 -F -L "ROOT" "${PART_ROOT}"
+
+    echo "[+] Mounting Target Filesystems into /mnt/gentoo..."
+    mkdir -p /mnt/gentoo
+    mount "${PART_ROOT}" /mnt/gentoo
+    mkdir -p /mnt/gentoo/boot/efi
+    mount "${PART_EFI}" /mnt/gentoo/boot/efi
+fi
 
 echo "[2/9] Downloading & Extracting Stage 3 Desktop OpenRC Tarball..."
 if [ ! -f /mnt/gentoo/bin/bash ]; then
@@ -114,13 +140,44 @@ cp /usr/share/portage/config/repos.conf /etc/portage/repos.conf/gentoo.conf 2>/d
 sed -i 's/sync-rsync-verify-metamanifest = yes/sync-rsync-verify-metamanifest = no/' /etc/portage/repos.conf/gentoo.conf 2>/dev/null || true
 emerge --sync || emerge-webrsync || true
 
-# Non-interactive emerge helper script
+# Best-effort emerge helper: builds everything requested, but a single
+# package failing to build no longer takes down the whole list (or the rest
+# of the install) — Portage's own --keep-going skips just the failed atom
+# (and anything that depends on it) and carries on with the rest. Whatever's
+# still missing afterward gets reported so nothing fails silently.
 cat << 'AUTO_EOF' > /usr/local/bin/emerge-auto
 #!/usr/bin/env bash
-set -e
-emerge --autounmask-write=y --autounmask-continue=y "$@" || { etc-update --automode -5; emerge "$@"; }
+emerge --autounmask-write=y --autounmask-continue=y --keep-going "$@"
+if [ $? -ne 0 ]; then
+    etc-update --automode -5
+    emerge --keep-going "$@" || true
+fi
+
+MISSING=""
+for atom in "$@"; do
+    portageq has_version / "${atom}" >/dev/null 2>&1 || MISSING="${MISSING} ${atom}"
+done
+if [ -n "${MISSING}" ]; then
+    echo "[!] WARNING: the following package(s) failed to build and were skipped:${MISSING}"
+fi
+exit 0
 AUTO_EOF
 chmod +x /usr/local/bin/emerge-auto
+
+# Use after emerge-auto for the handful of packages later steps genuinely
+# can't proceed without (the kernel sources, the bootloader, etc.) — unlike
+# emerge-auto itself, this one is meant to stop the script with a clear
+# message rather than let a missing essential package cause a confusing
+# failure two steps later.
+cat << 'REQ_EOF' > /usr/local/bin/require-installed
+#!/usr/bin/env bash
+if ! portageq has_version / "$1" >/dev/null 2>&1; then
+    echo "[-] ERROR: ${1} is not installed (${2:-required by a later step}) and this script cannot continue without it." >&2
+    echo "[-] Check the emerge log above for why it failed to build, fix it, then re-run this script." >&2
+    exit 1
+fi
+REQ_EOF
+chmod +x /usr/local/bin/require-installed
 
 echo "[+] Setting Timezone & Locales..."
 echo "Asia/Ho_Chi_Minh" > /etc/timezone
@@ -137,12 +194,24 @@ eselect locale set en_US.utf8 || true
 env-update && source /etc/profile
 
 echo "[+] Emerging Kernel Sources, Build Tools, & Dependencies..."
-/usr/local/bin/emerge-auto sys-kernel/vanilla-sources sys-apps/pciutils sys-apps/usbutils dev-lang/rust dev-lang/python dev-util/cbindgen llvm-core/clang llvm-core/lld llvm-core/llvm net-libs/nodejs sys-apps/yarn
+/usr/local/bin/emerge-auto sys-kernel/zen-sources sys-apps/pciutils sys-apps/usbutils dev-lang/python
 
 echo "[+] Emerging Firmware & Microcode..."
 /usr/local/bin/emerge-auto sys-kernel/linux-firmware sys-firmware/intel-microcode
 
+if [ -f /boot/vmlinuz ]; then
+    echo "[+] /boot/vmlinuz already present — skipping kernel compile (delete it to force a rebuild)."
+else
+require-installed sys-kernel/zen-sources "needed to build the kernel"
 echo "[+] Compiling Custom Monolithic Zen Kernel (vmlinuz)..."
+echo "[+] Setting Active Kernel Source Symlink (/usr/src/linux)..."
+eselect kernel set 1 2>/dev/null || true
+if [ ! -d /usr/src/linux ]; then
+    KERNEL_DIR=$(ls -d /usr/src/linux-* 2>/dev/null | head -n 1)
+    if [ -n "$KERNEL_DIR" ]; then
+        ln -sf "$KERNEL_DIR" /usr/src/linux
+    fi
+fi
 cd /usr/src/linux
 make defconfig < /dev/null
 
@@ -165,7 +234,7 @@ scripts/config --enable CONFIG_BLK_DEV_NVME
 scripts/config --enable CONFIG_NVME_CORE
 scripts/config --enable CONFIG_NVME_MULTIPATH
 scripts/config --enable CONFIG_USB_STORAGE
-scripts/config --enable CONFIG_UAS
+scripts/config --enable CONFIG_USB_UAS
 scripts/config --enable CONFIG_USB_XHCI_HCD
 scripts/config --enable CONFIG_USB_XHCI_PCI
 scripts/config --enable CONFIG_EXT4_FS
@@ -215,12 +284,13 @@ rm -f /boot/initramfs* /boot/intel-uc* /boot/initrd*
 # Copy monolithic kernel binaries explicitly to /boot
 cp -f arch/x86/boot/bzImage /boot/vmlinuz
 cp -f arch/x86/boot/bzImage /boot/vmlinuz-${KERNEL_VER}
+fi
 
 echo "[+] Setting Hostname & Accounts..."
 echo 'hostname="tlquan"' > /etc/conf.d/hostname
-echo "root:15031169" | chpasswd
-useradd -m -G wheel,audio,video,usb,portage,input truonglangquan || true
-echo "truonglangquan:15031169" | chpasswd
+echo "root:${ROOT_PW}" | chpasswd
+useradd -m -s /bin/bash -G wheel,audio,video,usb,portage,input truonglangquan || true
+echo "truonglangquan:${USER_PW}" | chpasswd
 
 echo "[+] Configuring /etc/fstab with Partition UUIDs..."
 ESP_UUID=$(blkid -s UUID -o value /dev/nvme0n1p1)
@@ -249,15 +319,20 @@ echo "[+] Emerging System Drivers, PipeWire Audio, Networking, Wi-Fi Tools, & GR
 /usr/local/bin/emerge-auto net-misc/networkmanager net-wireless/wpa_supplicant net-wireless/wireless-regdb net-wireless/bluez app-admin/sysklogd sys-process/cronie sys-fs/e2fsprogs net-wireless/iw media-libs/mesa x11-libs/libdrm media-libs/libva-intel-media-driver media-video/pipewire media-video/wireplumber sys-boot/grub gentoolkit
 
 echo "[+] Installing Multi-Path EFI Bootloader for UEFI Compatibility..."
+require-installed sys-boot/grub "needed to install the bootloader"
 ln -sf /proc/self/mounts /etc/mtab
 
-# Disable initrd autogeneration & fragile UUID searches in GRUB defaults
-echo "GRUB_DISABLE_INITRD=true" >> /etc/default/grub
-echo "GRUB_DISABLE_UUID=true" >> /etc/default/grub
+# Disable initrd autogeneration (monolithic kernel, no initramfs).
+# We deliberately leave GRUB_DISABLE_UUID unset — grub-mkconfig detects and
+# writes its own root= for us. Hand-injecting a second root= into
+# GRUB_CMDLINE_LINUX below used to produce two conflicting root= params on
+# the same kernel command line, so that injection has been removed.
+grep -q '^GRUB_DISABLE_INITRD=true' /etc/default/grub 2>/dev/null || echo "GRUB_DISABLE_INITRD=true" >> /etc/default/grub
 
-# Direct kernel command line with exact PARTUUID, rootfstype=ext4, early console output, and root waiting
-sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="console=tty1 earlycon=efifb intel_iommu=on i915.enable_guc=3 /' /etc/default/grub
-sed -i "s/GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"root=PARTUUID=${ROOT_PARTUUID} rootfstype=ext4 rootwait rw /" /etc/default/grub
+# Extra boot params only — no root=/rootfstype= here, grub-mkconfig supplies those.
+# Guarded so re-running this script doesn't prepend the same flags twice.
+grep -q 'i915.enable_guc=3' /etc/default/grub 2>/dev/null || \
+    sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="console=tty1 earlycon=efifb intel_iommu=on i915.enable_guc=3 rootwait /' /etc/default/grub
 
 # Primary removable GRUB install with all storage & display modules embedded
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck --modules="part_gpt part_msdos fat ext2 normal boot configfile search search_fs_uuid search_label efi_gop efi_uga font gfxterm linux"
@@ -273,18 +348,25 @@ cp -f /boot/efi/EFI/BOOT/BOOTX64.EFI /boot/efi/EFI/Microsoft/Boot/bootmgfw.efi 2
 
 grub-mkconfig -o /boot/grub/grub.cfg
 
-# Generate clean, explicit grub.cfg fallback menu (No missing UUID or initrd hangs!)
+# Generate a standalone fallback grub.cfg next to BOOTX64.EFI on the ESP, as
+# insurance in case grub-install's embedded prefix doesn't resolve correctly
+# on this firmware. /vmlinuz lives on the ROOT ext4 partition, not the ESP
+# this file is stored on, so we must explicitly search for and set root by
+# filesystem UUID before referencing it — otherwise "linux /vmlinuz" resolves
+# against the ESP (wherever this file was loaded from) and fails to find it.
 cat << GRUB_CFG_EOF > /boot/efi/EFI/BOOT/grub.cfg
 set default=0
 set timeout=3
 
 menuentry "Gentoo Linux Monolithic (Bare-Metal NVMe Boot)" {
-    insmod gpt
+    insmod part_gpt
     insmod fat
     insmod ext2
     insmod efi_gop
     insmod efi_uga
-    linux /vmlinuz root=PARTUUID=${ROOT_PARTUUID} rootfstype=ext4 rootwait rw console=tty1 earlycon=efifb intel_iommu=on i915.enable_guc=3
+    insmod search_fs_uuid
+    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
+    linux /vmlinuz root=PARTUUID=${ROOT_PARTUUID} rootfstype=ext4 rw rootwait console=tty1 earlycon=efifb intel_iommu=on i915.enable_guc=3
 }
 GRUB_CFG_EOF
 
@@ -294,43 +376,20 @@ echo "[+] Installing Git, Vim, Neovim, Kitty, Dolphin, and eselect-repository...
 /usr/local/bin/emerge-auto dev-vcs/git app-editors/vim app-editors/neovim x11-terms/kitty kde-apps/dolphin app-eselect/eselect-repository
 
 echo "[+] Enabling and Syncing GURU Repository..."
-eselect repository enable guru
-emaint sync -r guru
-
-echo "[+] Cloning & Compiling Zen Browser from Source..."
-mkdir -p /usr/src
-cd /usr/src
-rm -rf zen-browser
-git clone --recursive https://github.com/zen-browser/desktop.git zen-browser
-cd zen-browser
-
-npm install -g yarn cbindgen || true
-yarn install < /dev/null
-
-echo "[+] Exporting Environment Variables for Zen Engine Build..."
-export PATH="/usr/lib/llvm/22/bin:$PATH"
-export LLVM_CONFIG="/usr/lib/llvm/22/bin/llvm-config"
-export LIBCLANG_PATH="/usr/lib/llvm/22/lib64"
-export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
-
-npm run init < /dev/null
-
-# Configure mozconfig for Gentoo bindgen & WASM build
-cat << 'MOZCONFIG_EOF' >> configs/common/mozconfig
-ac_add_options --with-libclang-path=/usr/lib/llvm/22/lib64
-ac_add_options --without-wasm-sandboxed-libraries
-MOZCONFIG_EOF
-
-cat << 'MOZCONFIG_EOF' >> configs/linux/mozconfig
-ac_add_options --with-libclang-path=/usr/lib/llvm/22/lib64
-ac_add_options --without-wasm-sandboxed-libraries
-MOZCONFIG_EOF
-
-npm run build < /dev/null
-
-echo "[+] Installing Zen Browser to /usr/local/bin/zen-browser..."
-cp -r src/out/zen /opt/zen-browser || cp -r dist/zen /opt/zen-browser || true
-ln -sf /opt/zen-browser/zen /usr/local/bin/zen-browser || true
+eselect repository enable guru || true
+GURU_SYNCED=0
+for attempt in 1 2 3; do
+    if emaint sync -r guru; then
+        GURU_SYNCED=1
+        break
+    fi
+    echo "[!] GURU sync attempt ${attempt}/3 failed (network issue reaching github.com?) — retrying in 5s..."
+    sleep 5
+done
+if [ "${GURU_SYNCED}" -ne 1 ]; then
+    echo "[!] WARNING: could not sync the GURU overlay after 3 attempts. Continuing without it —"
+    echo "[!] nothing later in this script actually installs a package from GURU, so this is safe to skip."
+fi
 
 echo "[+] Enabling System Services (NetworkManager, PipeWire, Cronie, Sysklogd)..."
 rc-update add NetworkManager default
