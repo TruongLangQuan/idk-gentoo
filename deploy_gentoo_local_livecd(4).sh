@@ -19,10 +19,17 @@ echo "[+] Target Drive: /dev/nvme0n1 (Physical 1TB NVMe SSD)"
 echo "[+] Output Log File: ${LOG_FILE}"
 echo "======================================================================"
 
-DISK="/dev/nvme0n1"
-PART_EFI="${DISK}p1"
-PART_SWAP="${DISK}p2"
-PART_ROOT="${DISK}p3"
+DETECTED_DISK=$(lsblk -dno NAME,SIZE | grep -E 'nvme0n1|sda|sdb' | head -n 1 | awk '{print "/dev/"$1}')
+DISK="${DETECTED_DISK:-/dev/nvme0n1}"
+if echo "${DISK}" | grep -q "nvme"; then
+    PART_EFI="${DISK}p1"
+    PART_SWAP="${DISK}p2"
+    PART_ROOT="${DISK}p3"
+else
+    PART_EFI="${DISK}1"
+    PART_SWAP="${DISK}2"
+    PART_ROOT="${DISK}3"
+fi
 
 # Root/user passwords: never hardcode these in the script. Pull from the
 # environment if already set (useful for unattended/CI-style runs), otherwise
@@ -222,7 +229,7 @@ scripts/config --enable CONFIG_EXTRA_FIRMWARE
 scripts/config --set-str CONFIG_EXTRA_FIRMWARE_DIR "/lib/firmware"
 scripts/config --set-str CONFIG_EXTRA_FIRMWARE "intel-ucode/06-8c-01 i915/tgl_dmc_ver2_12.bin i915/tgl_guc_70.bin i915/tgl_guc_70.1.1.bin i915/tgl_huc_7.9.3.bin i915/tgl_huc.bin"
 
-# 2. Built-in Storage, Controller & Filesystem Drivers (Bare-Metal NVMe Fix)
+# 2. Built-in Dual-Mode Storage Controllers (PCIe NVMe + External USB Enclosure UAS/SCSI)
 scripts/config --enable CONFIG_PCI
 scripts/config --enable CONFIG_PCI_MSI
 scripts/config --enable CONFIG_PARTITION_ADVANCED
@@ -233,8 +240,10 @@ scripts/config --enable CONFIG_BLK_DEV_SD
 scripts/config --enable CONFIG_BLK_DEV_NVME
 scripts/config --enable CONFIG_NVME_CORE
 scripts/config --enable CONFIG_NVME_MULTIPATH
+scripts/config --enable CONFIG_USB
+scripts/config --enable CONFIG_USB_SUPPORT
 scripts/config --enable CONFIG_USB_STORAGE
-scripts/config --enable CONFIG_USB_UAS
+scripts/config --enable CONFIG_UAS
 scripts/config --enable CONFIG_USB_XHCI_HCD
 scripts/config --enable CONFIG_USB_XHCI_PCI
 scripts/config --enable CONFIG_EXT4_FS
@@ -293,10 +302,14 @@ useradd -m -s /bin/bash -G wheel,audio,video,usb,portage,input truonglangquan ||
 echo "truonglangquan:${USER_PW}" | chpasswd
 
 echo "[+] Configuring /etc/fstab with Partition UUIDs..."
-ESP_UUID=$(blkid -s UUID -o value /dev/nvme0n1p1)
-SWAP_UUID=$(blkid -s UUID -o value /dev/nvme0n1p2)
-ROOT_UUID=$(blkid -s UUID -o value /dev/nvme0n1p3)
-ROOT_PARTUUID=$(blkid -s PARTUUID -o value /dev/nvme0n1p3)
+TARGET_PART_EFI=$(lsblk -lno NAME | grep -E 'nvme0n1p1|sda1|sdb1' | head -n 1 | awk '{print "/dev/"$1}')
+TARGET_PART_SWAP=$(lsblk -lno NAME | grep -E 'nvme0n1p2|sda2|sdb2' | head -n 1 | awk '{print "/dev/"$1}')
+TARGET_PART_ROOT=$(lsblk -lno NAME | grep -E 'nvme0n1p3|sda3|sdb3' | head -n 1 | awk '{print "/dev/"$1}')
+
+ESP_UUID=$(blkid -s UUID -o value "${TARGET_PART_EFI}")
+SWAP_UUID=$(blkid -s UUID -o value "${TARGET_PART_SWAP}")
+ROOT_UUID=$(blkid -s UUID -o value "${TARGET_PART_ROOT}")
+ROOT_PARTUUID=$(blkid -s PARTUUID -o value "${TARGET_PART_ROOT}")
 
 cat << FSTAB_EOF > /etc/fstab
 PARTUUID=${ROOT_PARTUUID}                     /               ext4        noatime,rw                          0       1
@@ -332,7 +345,7 @@ grep -q '^GRUB_DISABLE_INITRD=true' /etc/default/grub 2>/dev/null || echo "GRUB_
 # Extra boot params only — no root=/rootfstype= here, grub-mkconfig supplies those.
 # Guarded so re-running this script doesn't prepend the same flags twice.
 grep -q 'i915.enable_guc=3' /etc/default/grub 2>/dev/null || \
-    sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="console=tty1 earlycon=efifb intel_iommu=on i915.enable_guc=3 rootwait /' /etc/default/grub
+    sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="console=tty1 earlycon=efifb intel_iommu=on i915.enable_guc=3 rootwait rootdelay=2 /' /etc/default/grub
 
 # Primary removable GRUB install with all storage & display modules embedded
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck --modules="part_gpt part_msdos fat ext2 normal boot configfile search search_fs_uuid search_label efi_gop efi_uga font gfxterm linux"
@@ -358,7 +371,7 @@ cat << GRUB_CFG_EOF > /boot/efi/EFI/BOOT/grub.cfg
 set default=0
 set timeout=3
 
-menuentry "Gentoo Linux Monolithic (Bare-Metal NVMe Boot)" {
+menuentry "Gentoo Linux Monolithic (Dual-Boot Internal M.2 NVMe & External USB Enclosure)" {
     insmod part_gpt
     insmod fat
     insmod ext2
@@ -366,7 +379,7 @@ menuentry "Gentoo Linux Monolithic (Bare-Metal NVMe Boot)" {
     insmod efi_uga
     insmod search_fs_uuid
     search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
-    linux /vmlinuz root=PARTUUID=${ROOT_PARTUUID} rootfstype=ext4 rw rootwait console=tty1 earlycon=efifb intel_iommu=on i915.enable_guc=3
+    linux /vmlinuz root=PARTUUID=${ROOT_PARTUUID} rootfstype=ext4 rw rootwait rootdelay=2 console=tty1 earlycon=efifb intel_iommu=on i915.enable_guc=3
 }
 GRUB_CFG_EOF
 
