@@ -1,326 +1,525 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Gentoo Local LiveCD Bare-Metal Master Installation Script
-# Target Hardware: Lenovo ThinkPad L13 Gen 2 (Intel Tiger Lake i5-1145G7, Xe Graphics)
-# Target Storage: any NVMe or SATA/USB block device you select at runtime —
-#                 internal M.2 NVMe or an external NVMe-in-USB-enclosure both
-#                 work; see the drive-selection prompt below.
-# Execution Mode: Run DIRECTLY inside ThinkPad LiveCD / LiveUSB terminal, as:
-#                   bash deploy_gentoo_local_livecd.sh
-#                 NOT "sh deploy_gentoo_local_livecd.sh" — this script uses
-#                 bash-only syntax (process substitution for logging) that sh
-#                 / dash cannot parse at all.
+# Gentoo Production Bare-Metal Master Installer & Resilient State Engine
+# Target Hardware: Modern x86_64 (Lenovo ThinkPad L13 Gen 2 / Tiger Lake & Compatible)
+# Target Storage:  NVMe, SATA, USB block devices
+# Execution:       bash deploy_gentoo_local.sh [TARGET_DEVICE]
 # ==============================================================================
+
 if [ -z "${BASH_VERSION:-}" ]; then
-    echo "[-] ERROR: this script must be run with bash, not sh/dash." >&2
-    echo "[-] Run it as: bash $0" >&2
+    echo "[-] ERROR: This script requires Bash. Run as: bash $0 [TARGET_DEVICE]" >&2
     exit 1
 fi
 
-set -e
-set -o pipefail
+set -Eeuo pipefail
 
-LOG_FILE="gentoo_livecd_install.log"
+# ==============================================================================
+# GLOBAL CONSTANTS & LOGGING
+# ==============================================================================
+readonly STATE_DIR="/var/lib/gentoo-installer"
+readonly STATE_FILE="${STATE_DIR}/state.db"
+readonly MOUNT_POINT="/mnt/gentoo"
+readonly LOG_FILE="gentoo_livecd_install.log"
 
-# Force immediate unbuffered line-by-line logging to screen & log file
-exec > >(stdbuf -oL -eL tee -a "${LOG_FILE}") 2>&1
+# Force output to screen and append to log file
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
 echo "======================================================================"
-echo "[+] Gentoo Local LiveCD Bare-Metal Installer"
+echo "[+] Gentoo Production Bare-Metal Master Installer & State Engine"
 echo "[+] Output Log File: ${LOG_FILE}"
 echo "======================================================================"
 
-# Target drive selection: pass it explicitly as the first argument
-# (./deploy_gentoo_local_livecd.sh /dev/nvme0n1 or /dev/sda). With no argument,
-# it defaults to /dev/nvme0n1 if present (the common case — installing on the
-# internal drive); if that's not present either, you're shown every attached
-# block device and asked to pick one. No heuristic guessing beyond that
-# default on purpose — this script destructively partitions whatever it ends
-# up targeting, so picking the LiveCD's own boot media by accident would be a
-# bad day. Either way, you see size/model/transport and must type a real
-# confirmation before anything gets touched.
-if [ -n "$1" ]; then
-    if [ ! -b "$1" ]; then
-        echo "[-] ERROR: ${1} is not a block device. Run 'lsblk' to check available drives."
-        exit 1
+# Initialize state directory
+mkdir -p "${STATE_DIR}"
+
+# ==============================================================================
+# STATE DATABASE ENGINE
+# ==============================================================================
+db_set() {
+    local key="$1"
+    local val="$2"
+    mkdir -p "${STATE_DIR}"
+    if grep -q "^${key}=" "${STATE_FILE}" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${val}|" "${STATE_FILE}"
+    else
+        echo "${key}=${val}" >> "${STATE_FILE}"
     fi
-    DISK="$1"
-    echo "[+] Target drive given on the command line: ${DISK}"
-elif [ -b "/dev/nvme0n1" ]; then
-    DISK="/dev/nvme0n1"
-    echo "[+] No drive given — defaulting to ${DISK} (pass a different device path"
-    echo "[+] as an argument to target something else, e.g. an external USB enclosure)."
-else
-    echo "======================================================================"
-    echo "[+] Attached block devices:"
-    echo "======================================================================"
-    lsblk -dno NAME,SIZE,MODEL,TRAN,TYPE | awk '{printf "  /dev/%-14s %8s   %-20s  %-6s  %s\n", $1, $2, ($3=="" ? "-" : $3), ($4=="" ? "-" : $4), $5}'
-    echo "======================================================================"
-    echo "[!] Pick the drive to install Gentoo onto. Double-check this is NOT"
-    echo "[!] the LiveCD/LiveUSB you booted from — the TRAN column (usb/nvme/"
-    echo "[!] sata) and SIZE above should help tell them apart."
-    read -r -p "Target device (e.g. /dev/nvme0n1 or /dev/sda): " DISK || {
-        echo "[-] ERROR: could not read input (is this running in an interactive terminal? try: bash $0 /dev/nvme0n1)" >&2
-        exit 1
-    }
-    if [ ! -b "${DISK}" ]; then
-        echo "[-] ERROR: ${DISK} is not a block device."
-        exit 1
-    fi
-fi
-
-# Partition naming differs by device type: nvme/mmcblk/loop/nbd need a "p"
-# before the partition number (nvme0n1p1), plain sd/vd/hd disks don't (sda1).
-# The dividing line is simply whether the device name itself ends in a digit.
-DISK_BASENAME=$(basename "${DISK}")
-if echo "${DISK_BASENAME}" | grep -qE '[0-9]$'; then
-    PART_SUFFIX="p"
-else
-    PART_SUFFIX=""
-fi
-PART_EFI="${DISK}${PART_SUFFIX}1"
-PART_SWAP="${DISK}${PART_SUFFIX}2"
-PART_ROOT="${DISK}${PART_SUFFIX}3"
-
-DISK_SIZE_HUMAN=$(lsblk -dno SIZE "${DISK}" 2>/dev/null)
-DISK_MODEL_HUMAN=$(lsblk -dno MODEL "${DISK}" 2>/dev/null)
-DISK_BYTES=$(lsblk -dnbo SIZE "${DISK}" 2>/dev/null)
-MIN_BYTES=$((80 * 1024 * 1024 * 1024))
-if [ -n "${DISK_BYTES}" ] && [ "${DISK_BYTES}" -lt "${MIN_BYTES}" ]; then
-    echo "[-] ERROR: ${DISK} (${DISK_SIZE_HUMAN}) is smaller than 80GB — this script's"
-    echo "[-] partition layout (1GiB EFI + 64GiB swap) won't leave a usable root"
-    echo "[-] partition on a drive this size. Aborting without touching it."
-    exit 1
-fi
-
-echo "======================================================================"
-echo "[!] ABOUT TO COMPLETELY ERASE: ${DISK} (${DISK_SIZE_HUMAN} ${DISK_MODEL_HUMAN})"
-echo "[!] This is IRREVERSIBLE. Every partition and all data on this drive"
-echo "[!] will be destroyed, starting with the very next step."
-echo "======================================================================"
-read -r -p "Type WIPE (all caps) to confirm and continue: " CONFIRM_WIPE || {
-    echo "[-] ERROR: could not read input (is this running in an interactive terminal?)" >&2
-    exit 1
 }
-if [ "${CONFIRM_WIPE}" != "WIPE" ]; then
-    echo "[-] Confirmation not received — exiting without changing anything."
-    exit 1
-fi
 
-# Root/user passwords: never hardcode these in the script. Pull from the
-# environment if already set (useful for unattended/CI-style runs), otherwise
-# prompt interactively. These get exported so the chroot'd shell can see them.
-if [ -z "${ROOT_PW:-}" ]; then
-    read -r -s -p "Set password for root: " ROOT_PW || {
-        echo "[-] ERROR: could not read input (is this running in an interactive terminal? try: ROOT_PW=... USER_PW=... bash $0)" >&2
-        exit 1
-    }
-    echo
-fi
-if [ -z "${USER_PW:-}" ]; then
-    read -r -s -p "Set password for truonglangquan: " USER_PW || {
-        echo "[-] ERROR: could not read input (is this running in an interactive terminal? try: ROOT_PW=... USER_PW=... bash $0)" >&2
-        exit 1
-    }
-    echo
-fi
-export ROOT_PW USER_PW
+db_get() {
+    local key="$1"
+    local default="${2:-}"
+    if [[ -f "${STATE_FILE}" ]]; then
+        local line
+        line=$(grep "^${key}=" "${STATE_FILE}" 2>/dev/null | tail -n 1) || true
+        if [[ -n "${line}" ]]; then
+            echo "${line#*=}"
+            return 0
+        fi
+    fi
+    echo "${default}"
+}
 
-# Also make the chosen partitions visible to the chroot'd shell later on —
-# it's a separate bash process (via `chroot ... << 'CHROOT_SCRIPT'`), so
-# anything it needs that isn't recomputed from scratch inside the chroot has
-# to be passed through the environment like this.
-export PART_EFI PART_SWAP PART_ROOT
+mark_stage_completed() {
+    local stage="$1"
+    db_set "STAGE_${stage}" "COMPLETED"
+    db_set "STAGE_${stage}_TIMESTAMP" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    echo "[+] Stage [${stage}] successfully COMPLETED."
+}
 
-# Verify the drive is still there (belt-and-suspenders, since the confirmation
-# prompt above gives plenty of time for someone to unplug it by mistake)
-if [ ! -b "${DISK}" ]; then
-    echo "[-] ERROR: Device ${DISK} not found! Run 'lsblk' to check your drive name."
-    exit 1
-fi
+is_stage_completed() {
+    local stage="$1"
+    local status
+    status=$(db_get "STAGE_${stage}" "PENDING")
+    [[ "${status}" == "COMPLETED" ]]
+}
 
-# Resumability guard: if a previous run of this exact script already
-# partitioned and formatted the disk (recognized via the ROOT label we set
-# below), skip straight to mounting instead of wiping it again. This lets you
-# re-run the script after a failure further down without losing everything.
-EXISTING_ROOT_LABEL=$(blkid -s LABEL -o value "${PART_ROOT}" 2>/dev/null || true)
-
-if [ "${EXISTING_ROOT_LABEL}" = "ROOT" ]; then
-    echo "[1/9] Existing ROOT partition detected on ${PART_ROOT} — skipping partition/format, remounting as-is..."
-    swapon -v "${PART_SWAP}" 2>/dev/null || true
-    mkdir -p /mnt/gentoo
-    mountpoint -q /mnt/gentoo || mount "${PART_ROOT}" /mnt/gentoo
-    mkdir -p /mnt/gentoo/boot/efi
-    mountpoint -q /mnt/gentoo/boot/efi || mount "${PART_EFI}" /mnt/gentoo/boot/efi
-else
-    echo "[1/9] Deactivating swaps & unmounting existing partitions on ${DISK}..."
-    swapoff ${DISK}* 2>/dev/null || true
+# ==============================================================================
+# CLEANUP & ROLLBACK HANDLERS
+# ==============================================================================
+cleanup_mounts() {
+    echo "[*] Unmounting pseudo-filesystems and deactivating swap..."
     swapoff -a 2>/dev/null || true
 
-    umount -R /mnt/gentoo 2>/dev/null || true
-    umount -R ${DISK}* 2>/dev/null || true
+    if mountpoint -q "${MOUNT_POINT}/boot/efi" 2>/dev/null; then
+        umount -l "${MOUNT_POINT}/boot/efi" 2>/dev/null || true
+    fi
 
-    echo "[+] Creating GPT Partition Table (1G EFI, 64G Swap, Root rest)..."
-    parted -s "${DISK}" mklabel gpt
-    parted -s "${DISK}" mkpart "ESP" fat32 1MiB 1025MiB
-    parted -s "${DISK}" set 1 esp on
-    parted -s "${DISK}" mkpart "SWAP" linux-swap 1025MiB 65537MiB
-    parted -s "${DISK}" mkpart "ROOT" ext4 65537MiB 100%
+    local mp
+    for mp in run dev/pts dev sys/firmware/efi/efivars sys proc; do
+        if mountpoint -q "${MOUNT_POINT}/${mp}" 2>/dev/null; then
+            umount -l "${MOUNT_POINT}/${mp}" 2>/dev/null || true
+        fi
+    done
+
+    if mountpoint -q "${MOUNT_POINT}" 2>/dev/null; then
+        umount -l "${MOUNT_POINT}" 2>/dev/null || true
+    fi
+}
+
+rollback_and_exit() {
+    local exit_code="${1:-1}"
+    local line_no="${2:-unknown}"
+    echo "[-] CRITICAL FAILURE: Installation aborted at line ${line_no} (Exit Code: ${exit_code})" >&2
+    echo "[-] Performing safe rollback and cleanup..." >&2
+    cleanup_mounts
+    db_set "INSTALLER_STATUS" "FAILED"
+    db_set "FAILED_LINE" "${line_no}"
+    db_set "FAILED_TIMESTAMP" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    echo "[-] State database updated: ${STATE_FILE}" >&2
+    echo "[-] Safe rollback complete. Exiting." >&2
+    exit "${exit_code}"
+}
+
+handle_error() {
+    local exit_code="$1"
+    local line_no="$2"
+    rollback_and_exit "${exit_code}" "${line_no}"
+}
+
+handle_signal() {
+    local sig="$1"
+    echo "[-] Received termination signal ${sig}!" >&2
+    rollback_and_exit 128 "SIGNAL_${sig}"
+}
+
+trap 'handle_error $? $LINENO' ERR
+trap 'handle_signal INT' INT
+trap 'handle_signal TERM' TERM
+
+# ==============================================================================
+# HARDWARE DETECTION & CACHING
+# ==============================================================================
+detect_hardware() {
+    echo "[+] Detecting system hardware capabilities..."
+
+    local nproc_val ram_kb ram_mb march
+    nproc_val=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo || echo 4)
+    db_set "HW_CPU_CORES" "${nproc_val}"
+
+    ram_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+    ram_mb=$((ram_kb / 1024))
+    db_set "HW_RAM_MB" "${ram_mb}"
+
+    if grep -q "avx2" /proc/cpuinfo 2>/dev/null; then
+        march="x86-64-v3"
+    elif grep -q "sse4_2" /proc/cpuinfo 2>/dev/null; then
+        march="x86-64-v2"
+    else
+        march="x86-64"
+    fi
+    db_set "HW_MARCH" "${march}"
+
+    echo "[+] Hardware cached: CPU Threads=${nproc_val}, RAM=${ram_mb}MB, ISA=${march}"
+}
+
+# ==============================================================================
+# DISK SELECTION, SAFETY, & PARTITIONING
+# ==============================================================================
+select_and_configure_disk() {
+    local target_arg="${1:-}"
+    local selected_disk=""
+    local cached_disk
+    cached_disk=$(db_get "TARGET_DISK" "")
+
+    if is_stage_completed "DISK_SETUP" && [[ -n "${cached_disk}" ]] && [[ -b "${cached_disk}" ]]; then
+        echo "[+] Stage DISK_SETUP is already COMPLETED for ${cached_disk}."
+        echo "[+] Resuming installation using existing disk layout."
+        DISK="${cached_disk}"
+    else
+        if [[ -n "${target_arg}" ]]; then
+            if [[ ! -b "${target_arg}" ]]; then
+                echo "[-] ERROR: ${target_arg} is not a valid block device." >&2
+                exit 1
+            fi
+            selected_disk="${target_arg}"
+        else
+            echo "======================================================================"
+            echo "[+] Attached Block Devices:"
+            echo "======================================================================"
+            lsblk -dno NAME,SIZE,MODEL,TRAN,TYPE | awk '{printf "  /dev/%-14s %8s   %-20s  %-6s  %s\n", $1, $2, ($3=="" ? "-" : $3), ($4=="" ? "-" : $4), $5}'
+            echo "======================================================================"
+            read -r -p "Target device path (e.g. /dev/nvme0n1 or /dev/sda): " selected_disk || rollback_and_exit 1 $LINENO
+            if [[ ! -b "${selected_disk}" ]]; then
+                echo "[-] ERROR: ${selected_disk} is not a valid block device." >&2
+                exit 1
+            fi
+        fi
+
+        DISK="${selected_disk}"
+        db_set "TARGET_DISK" "${DISK}"
+
+        local disk_size_human disk_model_human disk_bytes min_bytes
+        disk_size_human=$(lsblk -dno SIZE "${DISK}" 2>/dev/null || echo "Unknown")
+        disk_model_human=$(lsblk -dno MODEL "${DISK}" 2>/dev/null || echo "Unknown")
+        disk_bytes=$(lsblk -dnbo SIZE "${DISK}" 2>/dev/null || echo 0)
+        min_bytes=$((80 * 1024 * 1024 * 1024))
+
+        if (( disk_bytes < min_bytes )); then
+            echo "[-] ERROR: ${DISK} (${disk_size_human}) is smaller than 80GB." >&2
+            exit 1
+        fi
+
+        echo "======================================================================"
+        echo "[!] SAFETY CHECK: ABOUT TO DESTROY ALL DATA ON: ${DISK}"
+        echo "[!] Size: ${disk_size_human} | Model: ${disk_model_human}"
+        echo "======================================================================"
+        local confirm_wipe=""
+        read -r -p "Type WIPE (all caps) to confirm and proceed: " confirm_wipe || rollback_and_exit 1 $LINENO
+        if [[ "${confirm_wipe}" != "WIPE" ]]; then
+            echo "[-] Confirmation not received. Exiting without modifying disk."
+            exit 1
+        fi
+
+        partition_and_format_disk "${DISK}"
+        mark_stage_completed "DISK_SETUP"
+    fi
+
+    local disk_base="${DISK##*/}"
+    local part_suffix=""
+    if [[ "${disk_base}" =~ [0-9]$ ]]; then
+        part_suffix="p"
+    fi
+    PART_EFI="${DISK}${part_suffix}1"
+    PART_SWAP="${DISK}${part_suffix}2"
+    PART_ROOT="${DISK}${part_suffix}3"
+
+    db_set "PART_EFI" "${PART_EFI}"
+    db_set "PART_SWAP" "${PART_SWAP}"
+    db_set "PART_ROOT" "${PART_ROOT}"
+}
+
+partition_and_format_disk() {
+    local disk="$1"
+    echo "[+] Wiping disk metadata and deactivating swap..."
+    cleanup_mounts
+
+    echo "[+] Creating GPT Partition Table on ${disk}..."
+    parted -s "${disk}" mklabel gpt
+    parted -s "${disk}" mkpart "ESP" fat32 1MiB 1025MiB
+    parted -s "${disk}" set 1 esp on
+    parted -s "${disk}" mkpart "SWAP" linux-swap 1025MiB 65537MiB
+    parted -s "${disk}" mkpart "ROOT" ext4 65537MiB 100%
 
     udevadm settle || sleep 2
 
-    echo "[+] Formatting Partitions (${PART_EFI}, ${PART_SWAP}, ${PART_ROOT})..."
-    mkfs.vfat -F 32 -n "EFI" "${PART_EFI}"
-    mkswap -L "SWAP" "${PART_SWAP}"
-    swapon -v "${PART_SWAP}" 2>/dev/null || true
-    mkfs.ext4 -F -L "ROOT" "${PART_ROOT}"
-
-    echo "[+] Mounting Target Filesystems into /mnt/gentoo..."
-    mkdir -p /mnt/gentoo
-    mount "${PART_ROOT}" /mnt/gentoo
-    mkdir -p /mnt/gentoo/boot/efi
-    mount "${PART_EFI}" /mnt/gentoo/boot/efi
-fi
-
-echo "[2/9] Downloading & Extracting Stage 3 Desktop OpenRC Tarball..."
-if [ ! -f /mnt/gentoo/bin/bash ]; then
-    echo "[!] Fetching Latest Stage3 OpenRC URL..."
-    cd /mnt/gentoo
-    rm -f stage3-*.tar.xz 2>/dev/null || true
-    STAGE3_PATH=$(curl -s https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-desktop-openrc.txt | grep '.tar.xz' | awk '{print $1}' | head -n 1)
-    if [ -n "$STAGE3_PATH" ]; then
-        wget -c "https://distfiles.gentoo.org/releases/amd64/autobuilds/${STAGE3_PATH}"
-    else
-        wget -c "https://distfiles.gentoo.org/releases/amd64/autobuilds/20260719T170103Z/stage3-amd64-desktop-openrc-20260719T170103Z.tar.xz"
+    local disk_base="${disk##*/}"
+    local part_suffix=""
+    if [[ "${disk_base}" =~ [0-9]$ ]]; then
+        part_suffix="p"
     fi
-    echo "[!] Extracting Stage3 Tarball into /mnt/gentoo..."
-    tar xpf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner
-    rm -f stage3-*.tar.xz
-fi
+    local pefi="${disk}${part_suffix}1"
+    local pswap="${disk}${part_suffix}2"
+    local proot="${disk}${part_suffix}3"
 
-echo "[3/9] Configuring /etc/portage/make.conf & 64GB Swap Acceleration..."
-mkdir -p /mnt/gentoo/etc/portage
+    echo "[+] Formatting Partitions (${pefi}, ${pswap}, ${proot})..."
+    mkfs.vfat -F 32 -n "EFI" "${pefi}"
+    mkswap -L "SWAP" "${pswap}"
+    mkfs.ext4 -F -L "ROOT" "${proot}"
 
-cat << 'MAKE_EOF' > /mnt/gentoo/etc/portage/make.conf
-COMMON_FLAGS="-O2 -march=x86-64-v3 -pipe"
-CFLAGS="${COMMON_FLAGS}"
-CXXFLAGS="${COMMON_FLAGS}"
-FCFLAGS="${COMMON_FLAGS}"
-FFLAGS="${COMMON_FLAGS}"
-MAKEOPTS="-j8 -l8"
-EMERGE_DEFAULT_OPTS="--jobs=8 --load-average=8.0 --with-bdeps=n"
+    udevadm settle || sleep 1
+
+    local esp_uuid swap_uuid root_uuid root_partuuid
+    esp_uuid=$(blkid -s UUID -o value "${pefi}")
+    swap_uuid=$(blkid -s UUID -o value "${pswap}")
+    root_uuid=$(blkid -s UUID -o value "${proot}")
+    root_partuuid=$(blkid -s PARTUUID -o value "${proot}")
+
+    db_set "ESP_UUID" "${esp_uuid}"
+    db_set "SWAP_UUID" "${swap_uuid}"
+    db_set "ROOT_UUID" "${root_uuid}"
+    db_set "ROOT_PARTUUID" "${root_partuuid}"
+
+    echo "[+] Partitions formatted successfully. UUIDs stored in database."
+}
+
+# ==============================================================================
+# FILESYSTEM MOUNTING & BIND MOUNTS
+# ==============================================================================
+mount_target_filesystems() {
+    echo "[+] Mounting filesystems into ${MOUNT_POINT}..."
+    local proot pefi pswap
+    proot=$(db_get "PART_ROOT" "${PART_ROOT}")
+    pefi=$(db_get "PART_EFI" "${PART_EFI}")
+    pswap=$(db_get "PART_SWAP" "${PART_SWAP}")
+
+    mkdir -p "${MOUNT_POINT}"
+    if ! mountpoint -q "${MOUNT_POINT}"; then
+        mount "${proot}" "${MOUNT_POINT}"
+    fi
+
+    mkdir -p "${MOUNT_POINT}/boot/efi"
+    if ! mountpoint -q "${MOUNT_POINT}/boot/efi"; then
+        mount "${pefi}" "${MOUNT_POINT}/boot/efi"
+    fi
+
+    swapon "${pswap}" 2>/dev/null || true
+
+    mkdir -p "${MOUNT_POINT}${STATE_DIR}"
+    cp -f "${STATE_FILE}" "${MOUNT_POINT}${STATE_FILE}" 2>/dev/null || true
+}
+
+mount_bind_filesystems() {
+    echo "[+] Mounting bind pseudo-filesystems..."
+    mkdir -p "${MOUNT_POINT}/etc"
+    cp --dereference /etc/resolv.conf "${MOUNT_POINT}/etc/"
+
+    mountpoint -q "${MOUNT_POINT}/proc" || mount --types proc /proc "${MOUNT_POINT}/proc"
+    mountpoint -q "${MOUNT_POINT}/sys" || { mount --rbind /sys "${MOUNT_POINT}/sys" && mount --make-rslave "${MOUNT_POINT}/sys"; }
+    mountpoint -q "${MOUNT_POINT}/dev" || { mount --rbind /dev "${MOUNT_POINT}/dev" && mount --make-rslave "${MOUNT_POINT}/dev"; }
+    mountpoint -q "${MOUNT_POINT}/run" || { mount --bind /run "${MOUNT_POINT}/run" && mount --make-rslave "${MOUNT_POINT}/run"; }
+
+    if [[ -d /sys/firmware/efi/efivars ]]; then
+        mkdir -p "${MOUNT_POINT}/sys/firmware/efi/efivars"
+        mountpoint -q "${MOUNT_POINT}/sys/firmware/efi/efivars" || mount --bind /sys/firmware/efi/efivars "${MOUNT_POINT}/sys/firmware/efi/efivars"
+    fi
+}
+
+# ==============================================================================
+# STAGE3 DOWNLOAD, CHECKSUM VERIFICATION, & EXTRACTION
+# ==============================================================================
+fetch_and_extract_stage3() {
+    if is_stage_completed "STAGE3_FETCH" && [[ -x "${MOUNT_POINT}/bin/bash" ]]; then
+        echo "[+] Stage STAGE3_FETCH is already COMPLETED. Target rootfs intact."
+        return 0
+    fi
+
+    echo "[+] Resolving latest Stage3 OpenRC tarball URL..."
+    cd "${MOUNT_POINT}"
+
+    local base_url="https://distfiles.gentoo.org/releases/amd64/autobuilds"
+    local txt_path
+    txt_path=$(curl -s "${base_url}/latest-stage3-amd64-desktop-openrc.txt" | grep -v '^#' | grep '\.tar\.xz' | awk '{print $1}' | head -n 1)
+
+    if [[ -z "${txt_path}" ]]; then
+        echo "[-] ERROR: Unable to locate stage3 archive path from distfiles." >&2
+        rollback_and_exit 1 $LINENO
+    fi
+
+    local tarball_filename="${txt_path##*/}"
+    local full_tarball_url="${base_url}/${txt_path}"
+    local sha256_url="${full_tarball_url}.sha256"
+    local digests_url="${base_url}/${txt_path%/*}/DIGESTS"
+
+    echo "[+] Downloading ${tarball_filename} (resumable)..."
+    curl -sSL -C - -O "${full_tarball_url}" || wget -c "${full_tarball_url}"
+
+    echo "[+] Downloading checksums..."
+    curl -sSL -O "${sha256_url}" || wget -O "${tarball_filename}.sha256" "${sha256_url}" || true
+    curl -sSL -O "${digests_url}" || true
+
+    echo "[+] Verifying SHA256 checksum integrity..."
+    local verification_passed=0
+
+    if [[ -f "${tarball_filename}.sha256" ]]; then
+        if sha256sum -c "${tarball_filename}.sha256" 2>/dev/null; then
+            verification_passed=1
+        fi
+    fi
+
+    if (( verification_passed == 0 )) && [[ -f "DIGESTS" ]]; then
+        local expected_sha256 actual_sha256
+        expected_sha256=$(grep -A 1 "# SHA256 HASH" DIGESTS 2>/dev/null | grep "${tarball_filename}" | awk '{print $1}' | head -n 1)
+        if [[ -z "${expected_sha256}" ]]; then
+            expected_sha256=$(grep "${tarball_filename}" DIGESTS 2>/dev/null | grep -iE '[a-f0-9]{64}' | awk '{print $1}' | head -n 1)
+        fi
+        if [[ -n "${expected_sha256}" ]]; then
+            actual_sha256=$(sha256sum "${tarball_filename}" | awk '{print $1}')
+            if [[ "${actual_sha256}" == "${expected_sha256}" ]]; then
+                verification_passed=1
+            fi
+        fi
+    fi
+
+    if (( verification_passed == 0 )); then
+        echo "[-] CRITICAL: SHA256 checksum verification failed for ${tarball_filename}!" >&2
+        rm -f "${tarball_filename}" "${tarball_filename}.sha256" DIGESTS
+        rollback_and_exit 1 $LINENO
+    fi
+
+    echo "[+] SHA256 checksum verified successfully."
+    echo "[+] Extracting Stage3 Tarball into ${MOUNT_POINT}..."
+    tar xpf "${tarball_filename}" --xattrs-include='*.*' --numeric-owner -C "${MOUNT_POINT}"
+
+    rm -f "${tarball_filename}" "${tarball_filename}.sha256" DIGESTS
+
+    if [[ ! -x "${MOUNT_POINT}/bin/bash" ]] || [[ ! -d "${MOUNT_POINT}/etc" ]]; then
+        echo "[-] ERROR: Rootfs validation failed after stage3 extract!" >&2
+        rollback_and_exit 1 $LINENO
+    fi
+
+    mark_stage_completed "STAGE3_FETCH"
+}
+
+# ==============================================================================
+# DYNAMIC PORTAGE & COMPILATION OPTIMIZATION
+# ==============================================================================
+generate_portage_config() {
+    echo "[+] Generating dynamically tuned /etc/portage/make.conf..."
+
+    local ram_mb cpu_cores march
+    ram_mb=$(db_get "HW_RAM_MB" 4096)
+    cpu_cores=$(db_get "HW_CPU_CORES" 4)
+    march=$(db_get "HW_MARCH" "x86-64-v3")
+
+    local max_jobs_by_ram=$((ram_mb / 2048))
+    if (( max_jobs_by_ram < 1 )); then
+        max_jobs_by_ram=1
+    fi
+
+    local jobs=$cpu_cores
+    if (( jobs > max_jobs_by_ram )); then
+        jobs=$max_jobs_by_ram
+    fi
+    local load_avg=$cpu_cores
+
+    echo "[+] Dynamic Portage Specs: Cores=${cpu_cores}, RAM=${ram_mb}MB -> MAKEOPTS='-j${jobs} -l${load_avg}'"
+
+    mkdir -p "${MOUNT_POINT}/etc/portage"
+
+    cat << MAKE_EOF > "${MOUNT_POINT}/etc/portage/make.conf"
+# Gentoo Dynamic Production make.conf - Generated automatically
+COMMON_FLAGS="-O2 -march=${march} -pipe"
+CFLAGS="\${COMMON_FLAGS}"
+CXXFLAGS="\${COMMON_FLAGS}"
+FCFLAGS="\${COMMON_FLAGS}"
+FFLAGS="\${COMMON_FLAGS}"
+
+MAKEOPTS="-j${jobs} -l${load_avg}"
+EMERGE_DEFAULT_OPTS="--jobs=${jobs} --load-average=${load_avg} --with-bdeps=y --binpkg-respect-use=y"
+PORTAGE_NICENESS=19
+PORTAGE_IONICE_COMMAND="ionice -c 3 -p \${PID}"
+
 PORTAGE_TMPDIR="/var/tmp"
 USE="X wayland dbus elogind udev alsa pipewire wireplumber bluetooth wifi acpi unicode nls truetype opengl vulkan encode mp3 mp4 -systemd"
 ACCEPT_KEYWORDS="~amd64"
 ACCEPT_LICENSE="*"
 LC_MESSAGES=C.UTF-8
-FEATURES="parallel-fetch clean-logs strict"
+FEATURES="parallel-fetch compress-build-logs clean-logs strict"
 VIDEO_CARDS="intel iris"
 INPUT_DEVICES="libinput synaptics"
 GRUB_PLATFORMS="efi-64"
 MAKE_EOF
 
-echo "[4/9] Mounting Bind Pseudo-Filesystems..."
-cp --dereference /etc/resolv.conf /mnt/gentoo/etc/
-mount --types proc /proc /mnt/gentoo/proc 2>/dev/null || true
-mount --rbind /sys /mnt/gentoo/sys 2>/dev/null || true && mount --make-rslave /mnt/gentoo/sys 2>/dev/null || true
-mount --rbind /dev /mnt/gentoo/dev 2>/dev/null || true && mount --make-rslave /mnt/gentoo/dev 2>/dev/null || true
-mount --bind /run /mnt/gentoo/run 2>/dev/null || true && mount --make-rslave /mnt/gentoo/run 2>/dev/null || true
+    mark_stage_completed "PORTAGE_CONFIG"
+}
 
-echo "[5/9] Entering Chroot Environment for System Building..."
-chroot /mnt/gentoo /bin/bash << 'CHROOT_SCRIPT'
-set -e
+# ==============================================================================
+# PASSWORDS PROMPTING & INGESTION
+# ==============================================================================
+prompt_passwords() {
+    if [[ -z "${ROOT_PW:-}" ]]; then
+        read -r -s -p "Set password for root: " ROOT_PW || rollback_and_exit 1 $LINENO
+        echo
+    fi
+    if [[ -z "${USER_PW:-}" ]]; then
+        read -r -s -p "Set password for user truonglangquan: " USER_PW || rollback_and_exit 1 $LINENO
+        echo
+    fi
+    export ROOT_PW USER_PW
+}
+
+# ==============================================================================
+# CHROOT EXECUTION ENGINE & CHROOT STAGE IMPLEMENTATION
+# ==============================================================================
+run_chroot_stages() {
+    echo "[+] Preparing in-chroot installer script..."
+
+    local chroot_script="${MOUNT_POINT}/tmp/chroot_stage.sh"
+
+    local esp_uuid swap_uuid root_uuid root_partuuid
+    esp_uuid=$(db_get "ESP_UUID")
+    swap_uuid=$(db_get "SWAP_UUID")
+    root_uuid=$(db_get "ROOT_UUID")
+    root_partuuid=$(db_get "ROOT_PARTUUID")
+
+    cat << CHROOT_EOF > "${chroot_script}"
+#!/usr/bin/env bash
+set -Eeuo pipefail
 source /etc/profile
 
-echo "[+] Syncing Portage Tree..."
+echo "[+] Inside Chroot: Syncing Portage Repository..."
 mkdir -p /etc/portage/repos.conf
 cp /usr/share/portage/config/repos.conf /etc/portage/repos.conf/gentoo.conf 2>/dev/null || true
 sed -i 's/sync-rsync-verify-metamanifest = yes/sync-rsync-verify-metamanifest = no/' /etc/portage/repos.conf/gentoo.conf 2>/dev/null || true
-emerge --sync || emerge-webrsync || true
 
-# Best-effort emerge helper: builds everything requested, but a single
-# package failing to build no longer takes down the whole list (or the rest
-# of the install) — Portage's own --keep-going skips just the failed atom
-# (and anything that depends on it) and carries on with the rest. Whatever's
-# still missing afterward gets reported so nothing fails silently.
-cat << 'AUTO_EOF' > /usr/local/bin/emerge-auto
-#!/usr/bin/env bash
-emerge --autounmask-write=y --autounmask-continue=y --keep-going "$@"
-if [ $? -ne 0 ]; then
-    etc-update --automode -5
-    emerge --keep-going "$@" || true
-fi
-
-MISSING=""
-for atom in "$@"; do
-    portageq has_version / "${atom}" >/dev/null 2>&1 || MISSING="${MISSING} ${atom}"
-done
-if [ -n "${MISSING}" ]; then
-    echo "[!] WARNING: the following package(s) failed to build and were skipped:${MISSING}"
-fi
-exit 0
-AUTO_EOF
-chmod +x /usr/local/bin/emerge-auto
-
-# Use after emerge-auto for the handful of packages later steps genuinely
-# can't proceed without (the kernel sources, the bootloader, etc.) — unlike
-# emerge-auto itself, this one is meant to stop the script with a clear
-# message rather than let a missing essential package cause a confusing
-# failure two steps later.
-cat << 'REQ_EOF' > /usr/local/bin/require-installed
-#!/usr/bin/env bash
-if ! portageq has_version / "$1" >/dev/null 2>&1; then
-    echo "[-] ERROR: ${1} is not installed (${2:-required by a later step}) and this script cannot continue without it." >&2
-    echo "[-] Check the emerge log above for why it failed to build, fix it, then re-run this script." >&2
-    exit 1
-fi
-REQ_EOF
-chmod +x /usr/local/bin/require-installed
+emerge --sync || emerge-webrsync
 
 echo "[+] Setting Timezone & Locales..."
 echo "Asia/Ho_Chi_Minh" > /etc/timezone
-emerge --config sys-libs/timezone-data
-
 cat << 'LOCALE_EOF' > /etc/locale.gen
 C.UTF-8 UTF-8
 en_US.UTF-8 UTF-8
 vi_VN UTF-8
 LOCALE_EOF
 
-locale-gen || true
-eselect locale set en_US.utf8 || true
+locale-gen
+eselect locale set en_US.utf8 || eselect locale set C.UTF-8
 env-update && source /etc/profile
 
-echo "[+] Emerging Kernel Sources, Build Tools, & Dependencies..."
-/usr/local/bin/emerge-auto sys-kernel/zen-sources sys-apps/pciutils sys-apps/usbutils dev-lang/python
+echo "[+] Emerging Kernel Sources, Microcode, & Core Utilities..."
+emerge --autounmask-write=y --autounmask-continue=y --keep-going sys-kernel/zen-sources sys-apps/pciutils sys-apps/usbutils dev-lang/python sys-kernel/linux-firmware sys-firmware/intel-microcode
 
-echo "[+] Emerging Firmware & Microcode..."
-/usr/local/bin/emerge-auto sys-kernel/linux-firmware sys-firmware/intel-microcode
-
-if [ -f /boot/vmlinuz ]; then
-    echo "[+] /boot/vmlinuz already present — skipping kernel compile (delete it to force a rebuild)."
-else
-require-installed sys-kernel/zen-sources "needed to build the kernel"
-echo "[+] Compiling Custom Monolithic Zen Kernel (vmlinuz)..."
-echo "[+] Setting Active Kernel Source Symlink (/usr/src/linux)..."
+echo "[+] Configuring Kernel Build Tree..."
 eselect kernel set 1 2>/dev/null || true
-if [ ! -d /usr/src/linux ]; then
-    KERNEL_DIR=$(ls -d /usr/src/linux-* 2>/dev/null | head -n 1)
-    if [ -n "$KERNEL_DIR" ]; then
-        ln -sf "$KERNEL_DIR" /usr/src/linux
+if [[ ! -d /usr/src/linux ]]; then
+    KERNEL_DIR=\$(ls -d /usr/src/linux-* 2>/dev/null | head -n 1)
+    if [[ -n "\${KERNEL_DIR}" ]]; then
+        ln -sf "\${KERNEL_DIR}" /usr/src/linux
     fi
 fi
+
 cd /usr/src/linux
 make defconfig < /dev/null
 
-# 1. Built-in Firmware & Microcode
+# Firmware & Microcode
 scripts/config --enable CONFIG_MICROCODE
 scripts/config --enable CONFIG_MICROCODE_INTEL
 scripts/config --enable CONFIG_EXTRA_FIRMWARE
 scripts/config --set-str CONFIG_EXTRA_FIRMWARE_DIR "/lib/firmware"
 scripts/config --set-str CONFIG_EXTRA_FIRMWARE "intel-ucode/06-8c-01 i915/tgl_dmc_ver2_12.bin i915/tgl_guc_70.bin i915/tgl_guc_70.1.1.bin i915/tgl_huc_7.9.3.bin i915/tgl_huc.bin"
 
-# 2. Built-in Dual-Mode Storage Drivers (internal PCIe NVMe + external USB-enclosure)
+# Drivers: Storage, NVMe, USB, Filesystems, EFI
 scripts/config --enable CONFIG_PCI
 scripts/config --enable CONFIG_PCI_MSI
 scripts/config --enable CONFIG_PARTITION_ADVANCED
@@ -343,7 +542,7 @@ scripts/config --enable CONFIG_EXT4_FS_SECURITY
 scripts/config --enable CONFIG_VFAT_FS
 scripts/config --enable CONFIG_EFI_STUB
 
-# 3. Built-in Display & Framebuffer Drivers (Tiger Lake i5-1145G7 Xe Graphics)
+# Framebuffer & Display
 scripts/config --enable CONFIG_SYSFB_SIMPLEFB
 scripts/config --enable CONFIG_DRM_SIMPLEDRM
 scripts/config --enable CONFIG_FRAMEBUFFER_CONSOLE
@@ -351,7 +550,7 @@ scripts/config --enable CONFIG_VT_HW_CONSOLE_BINDING
 scripts/config --enable CONFIG_DRM_I915
 scripts/config --enable CONFIG_DRM_FBDEV_EMULATION
 
-# 4. Wireless (Wi-Fi) Driver Modules
+# Wi-Fi & Bluetooth
 scripts/config --module CONFIG_IWLWIFI
 scripts/config --module CONFIG_IWLMVM
 scripts/config --module CONFIG_IWLDVM
@@ -359,8 +558,6 @@ scripts/config --enable CONFIG_IWLWIFI_LEDS
 scripts/config --enable CONFIG_IWLWIFI_OPMODE_MODULAR
 scripts/config --enable CONFIG_CFG80211_WEXT
 scripts/config --enable CONFIG_MAC80211_LEDS
-
-# 5. Bluetooth Subsystem & Driver Modules
 scripts/config --module CONFIG_BT
 scripts/config --enable CONFIG_BT_BREDR
 scripts/config --module CONFIG_BT_RFCOMM
@@ -372,40 +569,33 @@ scripts/config --module CONFIG_BT_INTEL
 
 make olddefconfig < /dev/null
 
-make -j8 < /dev/null
-make modules_install < /dev/null || true
-make install < /dev/null || true
+echo "[+] Compiling Zen Kernel..."
+make -j\$(nproc) < /dev/null
+make modules_install < /dev/null
+make install < /dev/null
 
-KERNEL_VER=$(ls /lib/modules | head -n 1)
+KERNEL_VER=\$(make -s -C /usr/src/linux kernelrelease)
+echo "[+] Detected Kernel Version: \${KERNEL_VER}"
 
-# Remove any initramfs/microcode ramdisk images to ensure GRUB boots vmlinuz directly without initrd
+depmod -a "\${KERNEL_VER}"
+
 rm -f /boot/initramfs* /boot/intel-uc* /boot/initrd*
-
-# Copy monolithic kernel binaries explicitly to /boot
 cp -f arch/x86/boot/bzImage /boot/vmlinuz
-cp -f arch/x86/boot/bzImage /boot/vmlinuz-${KERNEL_VER}
-fi
+cp -f arch/x86/boot/bzImage "/boot/vmlinuz-\${KERNEL_VER}"
 
-echo "[+] Setting Hostname & Accounts..."
+echo "[+] Configuring Hostname & Accounts..."
 echo 'hostname="tlquan"' > /etc/conf.d/hostname
 echo "root:${ROOT_PW}" | chpasswd
-useradd -m -s /bin/bash -G wheel,audio,video,usb,portage,input truonglangquan || true
+useradd -m -s /bin/bash -G wheel,audio,video,usb,portage,input truonglangquan 2>/dev/null || true
 echo "truonglangquan:${USER_PW}" | chpasswd
 
-echo "[+] Configuring /etc/fstab with Partition UUIDs..."
-ESP_UUID=$(blkid -s UUID -o value "${PART_EFI}")
-SWAP_UUID=$(blkid -s UUID -o value "${PART_SWAP}")
-ROOT_UUID=$(blkid -s UUID -o value "${PART_ROOT}")
-ROOT_PARTUUID=$(blkid -s PARTUUID -o value "${PART_ROOT}")
-
+echo "[+] Configuring /etc/fstab..."
 cat << FSTAB_EOF > /etc/fstab
-PARTUUID=${ROOT_PARTUUID}                     /               ext4        noatime,rw                          0       1
-UUID=${ESP_UUID}                            /boot/efi       vfat        defaults,noatime                    0       2
-UUID=${SWAP_UUID}                           none            swap        sw,pri=100                          0       0
+PARTUUID=${root_partuuid}                     /               ext4        noatime,rw                          0       1
+UUID=${esp_uuid}                            /boot/efi       vfat        defaults,noatime                    0       2
+UUID=${swap_uuid}                           none            swap        sw,pri=100                          0       0
 FSTAB_EOF
 
-# Enable high-priority swap and kernel swappiness tuning for heavy emerge compilations
-swapon -a 2>/dev/null || true
 mkdir -p /etc/sysctl.d
 cat << 'SYSCTL_EOF' > /etc/sysctl.d/99-swap.conf
 vm.swappiness = 80
@@ -413,31 +603,24 @@ vm.vfs_cache_pressure = 50
 vm.dirty_ratio = 15
 vm.dirty_background_ratio = 5
 SYSCTL_EOF
-sysctl -p /etc/sysctl.d/99-swap.conf 2>/dev/null || true
 
-echo "[+] Emerging System Drivers, PipeWire Audio, Networking, Wi-Fi Tools, & GRUB (EFI-64)..."
-/usr/local/bin/emerge-auto net-misc/networkmanager net-wireless/wpa_supplicant net-wireless/wireless-regdb net-wireless/bluez app-admin/sysklogd sys-process/cronie sys-fs/e2fsprogs net-wireless/iw media-libs/mesa x11-libs/libdrm media-libs/libva-intel-media-driver media-video/pipewire media-video/wireplumber sys-boot/grub gentoolkit
+echo "[+] Emerging System Applications & Desktop Utilities..."
+emerge --autounmask-write=y --autounmask-continue=y --keep-going net-misc/networkmanager net-wireless/wpa_supplicant net-wireless/wireless-regdb net-wireless/bluez app-admin/sysklogd sys-process/cronie sys-fs/e2fsprogs net-wireless/iw media-libs/mesa x11-libs/libdrm media-libs/libva-intel-media-driver media-video/pipewire media-video/wireplumber sys-boot/grub gentoolkit dev-vcs/git app-editors/vim app-editors/neovim x11-terms/kitty kde-apps/dolphin app-eselect/eselect-repository
 
-echo "[+] Installing Multi-Path EFI Bootloader for UEFI Compatibility..."
-require-installed sys-boot/grub "needed to install the bootloader"
+echo "[+] Enabling GURU Overlay..."
+eselect repository enable guru || true
+emaint sync -r guru || true
+
+echo "[+] Configuring GRUB EFI Bootloader..."
 ln -sf /proc/self/mounts /etc/mtab
 
-# Disable initrd autogeneration (monolithic kernel, no initramfs).
-# We deliberately leave GRUB_DISABLE_UUID unset — grub-mkconfig detects and
-# writes its own root= for us. Hand-injecting a second root= into
-# GRUB_CMDLINE_LINUX below used to produce two conflicting root= params on
-# the same kernel command line, so that injection has been removed.
 grep -q '^GRUB_DISABLE_INITRD=true' /etc/default/grub 2>/dev/null || echo "GRUB_DISABLE_INITRD=true" >> /etc/default/grub
 
-# Extra boot params only — no root=/rootfstype= here, grub-mkconfig supplies those.
-# Guarded so re-running this script doesn't prepend the same flags twice.
 grep -q 'i915.enable_guc=3' /etc/default/grub 2>/dev/null || \
     sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="console=tty1 earlycon=efifb intel_iommu=on i915.enable_guc=3 rootwait /' /etc/default/grub
 
-# Primary removable GRUB install with all storage & display modules embedded
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck --modules="part_gpt part_msdos fat ext2 normal boot configfile search search_fs_uuid search_label efi_gop efi_uga font gfxterm linux"
 
-# Copy EFI binary to all standard UEFI search paths
 mkdir -p /boot/efi/EFI/BOOT
 mkdir -p /boot/efi/EFI/gentoo
 mkdir -p /boot/efi/EFI/Microsoft/Boot
@@ -448,59 +631,177 @@ cp -f /boot/efi/EFI/BOOT/BOOTX64.EFI /boot/efi/EFI/Microsoft/Boot/bootmgfw.efi 2
 
 grub-mkconfig -o /boot/grub/grub.cfg
 
-# Generate a standalone fallback grub.cfg next to BOOTX64.EFI on the ESP, as
-# insurance in case grub-install's embedded prefix doesn't resolve correctly
-# on this firmware. /vmlinuz lives on the ROOT ext4 partition, not the ESP
-# this file is stored on, so we must explicitly search for and set root by
-# filesystem UUID before referencing it — otherwise "linux /vmlinuz" resolves
-# against the ESP (wherever this file was loaded from) and fails to find it.
 cat << GRUB_CFG_EOF > /boot/efi/EFI/BOOT/grub.cfg
 set default=0
 set timeout=3
 
-menuentry "Gentoo Linux Monolithic (Bare-Metal NVMe Boot)" {
+menuentry "Gentoo Linux Monolithic (Bare-Metal Boot)" {
     insmod part_gpt
     insmod fat
     insmod ext2
     insmod efi_gop
     insmod efi_uga
     insmod search_fs_uuid
-    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
-    linux /vmlinuz root=PARTUUID=${ROOT_PARTUUID} rootfstype=ext4 rw rootwait console=tty1 earlycon=efifb intel_iommu=on i915.enable_guc=3
+    search --no-floppy --fs-uuid --set=root ${root_uuid}
+    linux /vmlinuz root=PARTUUID=${root_partuuid} rootfstype=ext4 rw rootwait console=tty1 earlycon=efifb intel_iommu=on i915.enable_guc=3
 }
 GRUB_CFG_EOF
 
 cp -f /boot/efi/EFI/BOOT/grub.cfg /boot/grub/grub.cfg.fallback 2>/dev/null || true
 
-echo "[+] Installing Git, Vim, Neovim, Kitty, Dolphin, and eselect-repository..."
-/usr/local/bin/emerge-auto dev-vcs/git app-editors/vim app-editors/neovim x11-terms/kitty kde-apps/dolphin app-eselect/eselect-repository
-
-echo "[+] Enabling and Syncing GURU Repository..."
-eselect repository enable guru || true
-GURU_SYNCED=0
-for attempt in 1 2 3; do
-    if emaint sync -r guru; then
-        GURU_SYNCED=1
-        break
-    fi
-    echo "[!] GURU sync attempt ${attempt}/3 failed (network issue reaching github.com?) — retrying in 5s..."
-    sleep 5
-done
-if [ "${GURU_SYNCED}" -ne 1 ]; then
-    echo "[!] WARNING: could not sync the GURU overlay after 3 attempts. Continuing without it —"
-    echo "[!] nothing later in this script actually installs a package from GURU, so this is safe to skip."
-fi
-
-echo "[+] Enabling System Services (NetworkManager, PipeWire, Cronie, Sysklogd)..."
+echo "[+] Enabling OpenRC Services..."
 rc-update add NetworkManager default
 rc-update add sysklogd default
 rc-update add cronie default
 rc-update add dbus default
 rc-update add bluetooth default
 
-CHROOT_SCRIPT
+CHROOT_EOF
 
-echo "======================================================================"
-echo "[+] SUCCESS: Gentoo Local LiveCD Bare-Metal Installation Complete!"
-echo "[+] You may now unmount and reboot: umount -R /mnt/gentoo && reboot"
-echo "======================================================================"
+    chmod +x "${chroot_script}"
+
+    echo "[+] Executing chroot stage script..."
+    chroot "${MOUNT_POINT}" /bin/bash /tmp/chroot_stage.sh
+
+    rm -f "${chroot_script}"
+    mark_stage_completed "CHROOT_SYSTEM_BUILD"
+}
+
+# ==============================================================================
+# LIBRARY & BOOT VALIDATION ENGINES
+# ==============================================================================
+validate_libraries() {
+    echo "[+] Validating Core System Libraries (ldd verification)..."
+
+    local binaries=(
+        "/bin/bash"
+        "/sbin/init"
+        "/sbin/start-stop-daemon"
+        "/sbin/fsck.ext4"
+        "/sbin/openrc"
+    )
+
+    local bin missing_libs=0
+    for bin in "${binaries[@]}"; do
+        local target_bin="${MOUNT_POINT}${bin}"
+        if [[ ! -x "${target_bin}" ]]; then
+            echo "[-] ERROR: Missing critical binary: ${bin}" >&2
+            missing_libs=$((missing_libs + 1))
+            continue
+        fi
+
+        echo "[*] Checking ldd on ${bin}..."
+        local ldd_output
+        ldd_output=$(chroot "${MOUNT_POINT}" ldd "${bin}" 2>&1)
+        if echo "${ldd_output}" | grep -q "not found"; then
+            echo "[-] ERROR: Binary ${bin} has missing shared libraries!" >&2
+            echo "${ldd_output}" | grep "not found" >&2
+            missing_libs=$((missing_libs + 1))
+        fi
+    done
+
+    if (( missing_libs > 0 )); then
+        echo "[-] CRITICAL ERROR: Library validation failed with ${missing_libs} issues!" >&2
+        rollback_and_exit 1 $LINENO
+    fi
+
+    echo "[+] All system binary shared libraries validated successfully."
+}
+
+validate_boot_configuration() {
+    echo "[+] Validating Boot Configuration & Kernel Artifacts..."
+
+    # Check vmlinuz
+    if [[ ! -s "${MOUNT_POINT}/boot/vmlinuz" ]]; then
+        echo "[-] ERROR: /boot/vmlinuz is missing or empty!" >&2
+        rollback_and_exit 1 $LINENO
+    fi
+
+    # Check System.map
+    if ! compgen -G "${MOUNT_POINT}/boot/System.map*" >/dev/null; then
+        echo "[-] ERROR: System.map missing from /boot!" >&2
+        rollback_and_exit 1 $LINENO
+    fi
+
+    # Check kernel modules
+    local kernel_ver
+    kernel_ver=$(chroot "${MOUNT_POINT}" make -s -C /usr/src/linux kernelrelease 2>/dev/null || true)
+    if [[ -z "${kernel_ver}" ]] || [[ ! -d "${MOUNT_POINT}/lib/modules/${kernel_ver}" ]]; then
+        echo "[-] ERROR: Kernel modules missing for version '${kernel_ver}'!" >&2
+        rollback_and_exit 1 $LINENO
+    fi
+
+    # Check BOOTX64.EFI
+    if [[ ! -s "${MOUNT_POINT}/boot/efi/EFI/BOOT/bootx64.efi" ]]; then
+        echo "[-] ERROR: /boot/efi/EFI/BOOT/bootx64.efi is missing or empty!" >&2
+        rollback_and_exit 1 $LINENO
+    fi
+
+    # Check grub.cfg
+    if [[ ! -s "${MOUNT_POINT}/boot/grub/grub.cfg" ]]; then
+        echo "[-] ERROR: /boot/grub/grub.cfg is missing or empty!" >&2
+        rollback_and_exit 1 $LINENO
+    fi
+
+    # Check /etc/fstab UUIDs match state DB
+    local root_partuuid esp_uuid swap_uuid
+    root_partuuid=$(db_get "ROOT_PARTUUID")
+    esp_uuid=$(db_get "ESP_UUID")
+    swap_uuid=$(db_get "SWAP_UUID")
+
+    if ! grep -q "${root_partuuid}" "${MOUNT_POINT}/etc/fstab"; then
+        echo "[-] ERROR: /etc/fstab does not contain ROOT PARTUUID ${root_partuuid}!" >&2
+        rollback_and_exit 1 $LINENO
+    fi
+
+    if ! grep -q "${esp_uuid}" "${MOUNT_POINT}/etc/fstab"; then
+        echo "[-] ERROR: /etc/fstab does not contain ESP UUID ${esp_uuid}!" >&2
+        rollback_and_exit 1 $LINENO
+    fi
+
+    if ! grep -q "${swap_uuid}" "${MOUNT_POINT}/etc/fstab"; then
+        echo "[-] ERROR: /etc/fstab does not contain SWAP UUID ${swap_uuid}!" >&2
+        rollback_and_exit 1 $LINENO
+    fi
+
+    # Check OpenRC services enablement
+    local service
+    for service in NetworkManager sysklogd cronie dbus bluetooth; do
+        if [[ ! -L "${MOUNT_POINT}/etc/runlevels/default/${service}" ]] && [[ ! -f "${MOUNT_POINT}/etc/runlevels/default/${service}" ]]; then
+            echo "[-] WARNING: Service ${service} is missing from default runlevel!" >&2
+        fi
+    done
+
+    echo "[+] Boot configuration & kernel artifacts validated successfully."
+    mark_stage_completed "VALIDATION"
+}
+
+# ==============================================================================
+# MAIN INSTALLER PIPELINE
+# ==============================================================================
+main() {
+    local target_disk_arg="${1:-}"
+
+    detect_hardware
+    select_and_configure_disk "${target_disk_arg}"
+    mount_target_filesystems
+    fetch_and_extract_stage3
+    generate_portage_config
+    mount_bind_filesystems
+    prompt_passwords
+    run_chroot_stages
+    validate_libraries
+    validate_boot_configuration
+
+    db_set "INSTALLER_STATUS" "SUCCESS"
+    db_set "COMPLETED_TIMESTAMP" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+    echo "======================================================================"
+    echo "[+] GENTOO PRODUCTION INSTALLATION COMPLETED SUCCESSFULLY!"
+    echo "[+] All safety checks, library verifications, & boot validations PASSED."
+    echo "[+] You may now unmount and reboot safely:"
+    echo "[+]   umount -R /mnt/gentoo && reboot"
+    echo "======================================================================"
+}
+
+main "$@"
