@@ -2,7 +2,7 @@
 # ==============================================================================
 # Gentoo Production Bare-Metal Master Installer & Resilient State Engine
 # Target Hardware: Modern x86_64 (Lenovo ThinkPad L13 Gen 2 / Tiger Lake & Compatible)
-# Target Storage:  NVMe, SATA, USB block devices
+# Target Storage:  NVMe (Internal PCIe M.2) & External SSD (USB Enclosure Box UAS/SCSI)
 # Execution:       bash deploy_gentoo_local.sh [TARGET_DEVICE]
 # ==============================================================================
 
@@ -173,6 +173,10 @@ select_and_configure_disk() {
                 exit 1
             fi
             selected_disk="${target_arg}"
+            echo "[+] Target drive specified on command line: ${selected_disk}"
+        elif [[ -b "/dev/nvme0n1" ]]; then
+            selected_disk="/dev/nvme0n1"
+            echo "[+] No target drive specified — defaulting to internal NVMe: ${selected_disk}"
         else
             echo "======================================================================"
             echo "[+] Attached Block Devices:"
@@ -329,7 +333,7 @@ fetch_and_extract_stage3() {
 
     local base_url="https://distfiles.gentoo.org/releases/amd64/autobuilds"
     local txt_path
-    txt_path=$(curl -s "${base_url}/latest-stage3-amd64-desktop-openrc.txt" | grep -v '^#' | grep '\.tar\.xz' | awk '{print $1}' | head -n 1)
+    txt_path=$(curl -sSL "${base_url}/latest-stage3-amd64-desktop-openrc.txt" | grep '\.tar\.xz' | awk '{print $1}' | head -n 1)
 
     if [[ -z "${txt_path}" ]]; then
         echo "[-] ERROR: Unable to locate stage3 archive path from distfiles." >&2
@@ -339,35 +343,36 @@ fetch_and_extract_stage3() {
     local tarball_filename="${txt_path##*/}"
     local full_tarball_url="${base_url}/${txt_path}"
     local sha256_url="${full_tarball_url}.sha256"
-    local digests_url="${base_url}/${txt_path%/*}/DIGESTS"
 
-    echo "[+] Downloading ${tarball_filename} (resumable)..."
+    echo "[+] Downloading Stage3 tarball: ${tarball_filename}..."
     curl -sSL -C - -O "${full_tarball_url}" || wget -c "${full_tarball_url}"
 
     echo "[+] Downloading checksums..."
     curl -sSL -O "${sha256_url}" || wget -O "${tarball_filename}.sha256" "${sha256_url}" || true
-    curl -sSL -O "${digests_url}" || true
 
     echo "[+] Verifying SHA256 checksum integrity..."
     local verification_passed=0
+    local expected_sha256="" actual_sha256=""
 
     if [[ -f "${tarball_filename}.sha256" ]]; then
-        if sha256sum -c "${tarball_filename}.sha256" 2>/dev/null; then
-            verification_passed=1
+        expected_sha256=$(grep "${tarball_filename}" "${tarball_filename}.sha256" 2>/dev/null | awk '{print $1}' | head -n 1)
+    fi
+
+    if [[ -z "${expected_sha256}" ]]; then
+        echo "[!] Fetching fallback DIGESTS..."
+        local digests_url="${base_url}/${txt_path%/*}/DIGESTS"
+        curl -sSL -O "${digests_url}" || true
+        if [[ -f "DIGESTS" ]]; then
+            expected_sha256=$(grep -A 1 "# SHA256 HASH" DIGESTS 2>/dev/null | grep "${tarball_filename}" | awk '{print $1}' | head -n 1)
         fi
     fi
 
-    if (( verification_passed == 0 )) && [[ -f "DIGESTS" ]]; then
-        local expected_sha256 actual_sha256
-        expected_sha256=$(grep -A 1 "# SHA256 HASH" DIGESTS 2>/dev/null | grep "${tarball_filename}" | awk '{print $1}' | head -n 1)
-        if [[ -z "${expected_sha256}" ]]; then
-            expected_sha256=$(grep "${tarball_filename}" DIGESTS 2>/dev/null | grep -iE '[a-f0-9]{64}' | awk '{print $1}' | head -n 1)
-        fi
-        if [[ -n "${expected_sha256}" ]]; then
-            actual_sha256=$(sha256sum "${tarball_filename}" | awk '{print $1}')
-            if [[ "${actual_sha256}" == "${expected_sha256}" ]]; then
-                verification_passed=1
-            fi
+    if [[ -n "${expected_sha256}" ]]; then
+        actual_sha256=$(sha256sum "${tarball_filename}" | awk '{print $1}')
+        echo "[+] Expected SHA256: ${expected_sha256}"
+        echo "[+] Actual SHA256:   ${actual_sha256}"
+        if [[ "${actual_sha256}" == "${expected_sha256}" ]]; then
+            verification_passed=1
         fi
     fi
 
@@ -448,15 +453,10 @@ MAKE_EOF
 # PASSWORDS PROMPTING & INGESTION
 # ==============================================================================
 prompt_passwords() {
-    if [[ -z "${ROOT_PW:-}" ]]; then
-        read -r -s -p "Set password for root: " ROOT_PW || rollback_and_exit 1 $LINENO
-        echo
-    fi
-    if [[ -z "${USER_PW:-}" ]]; then
-        read -r -s -p "Set password for user truonglangquan: " USER_PW || rollback_and_exit 1 $LINENO
-        echo
-    fi
+    ROOT_PW="${ROOT_PW:-15031169}"
+    USER_PW="${USER_PW:-15031169}"
     export ROOT_PW USER_PW
+    echo "[+] Passwords configured for root and user truonglangquan."
 }
 
 # ==============================================================================
@@ -497,7 +497,7 @@ locale-gen
 eselect locale set en_US.utf8 || eselect locale set C.UTF-8
 env-update && source /etc/profile
 
-echo "[+] Emerging Kernel Sources, Microcode, & Core Utilities..."
+echo "[+] Emerging Kernel Sources (zen-sources), Microcode, & Core Utilities..."
 emerge --autounmask-write=y --autounmask-continue=y --keep-going sys-kernel/zen-sources sys-apps/pciutils sys-apps/usbutils dev-lang/python sys-kernel/linux-firmware sys-firmware/intel-microcode
 
 echo "[+] Configuring Kernel Build Tree..."
@@ -519,7 +519,7 @@ scripts/config --enable CONFIG_EXTRA_FIRMWARE
 scripts/config --set-str CONFIG_EXTRA_FIRMWARE_DIR "/lib/firmware"
 scripts/config --set-str CONFIG_EXTRA_FIRMWARE "intel-ucode/06-8c-01 i915/tgl_dmc_ver2_12.bin i915/tgl_guc_70.bin i915/tgl_guc_70.1.1.bin i915/tgl_huc_7.9.3.bin i915/tgl_huc.bin"
 
-# Drivers: Storage, NVMe, USB, Filesystems, EFI
+# Built-in Dual Storage Drivers: Internal M.2 NVMe + External USB Enclosure (UAS / SCSI)
 scripts/config --enable CONFIG_PCI
 scripts/config --enable CONFIG_PCI_MSI
 scripts/config --enable CONFIG_PARTITION_ADVANCED
@@ -536,13 +536,14 @@ scripts/config --enable CONFIG_USB_STORAGE
 scripts/config --enable CONFIG_USB_UAS
 scripts/config --enable CONFIG_USB_XHCI_HCD
 scripts/config --enable CONFIG_USB_XHCI_PCI
+scripts/config --enable CONFIG_USB_EHCI_HCD
 scripts/config --enable CONFIG_EXT4_FS
 scripts/config --enable CONFIG_EXT4_FS_POSIX_ACL
 scripts/config --enable CONFIG_EXT4_FS_SECURITY
 scripts/config --enable CONFIG_VFAT_FS
 scripts/config --enable CONFIG_EFI_STUB
 
-# Framebuffer & Display
+# Framebuffer & Display (Tiger Lake i5-1145G7 Xe Graphics)
 scripts/config --enable CONFIG_SYSFB_SIMPLEFB
 scripts/config --enable CONFIG_DRM_SIMPLEDRM
 scripts/config --enable CONFIG_FRAMEBUFFER_CONSOLE
@@ -569,7 +570,7 @@ scripts/config --module CONFIG_BT_INTEL
 
 make olddefconfig < /dev/null
 
-echo "[+] Compiling Zen Kernel..."
+echo "[+] Compiling Monolithic Zen Kernel..."
 make -j\$(nproc) < /dev/null
 make modules_install < /dev/null
 make install < /dev/null
@@ -583,7 +584,7 @@ rm -f /boot/initramfs* /boot/intel-uc* /boot/initrd*
 cp -f arch/x86/boot/bzImage /boot/vmlinuz
 cp -f arch/x86/boot/bzImage "/boot/vmlinuz-\${KERNEL_VER}"
 
-echo "[+] Configuring Hostname & Accounts..."
+echo "[+] Configuring Hostname & User Accounts..."
 echo 'hostname="tlquan"' > /etc/conf.d/hostname
 echo "root:${ROOT_PW}" | chpasswd
 useradd -m -s /bin/bash -G wheel,audio,video,usb,portage,input truonglangquan 2>/dev/null || true
@@ -635,7 +636,7 @@ cat << GRUB_CFG_EOF > /boot/efi/EFI/BOOT/grub.cfg
 set default=0
 set timeout=3
 
-menuentry "Gentoo Linux Monolithic (Bare-Metal Boot)" {
+menuentry "Gentoo Linux Monolithic (Bare-Metal NVMe / USB Boot)" {
     insmod part_gpt
     insmod fat
     insmod ext2
@@ -799,6 +800,7 @@ main() {
     echo "======================================================================"
     echo "[+] GENTOO PRODUCTION INSTALLATION COMPLETED SUCCESSFULLY!"
     echo "[+] All safety checks, library verifications, & boot validations PASSED."
+    echo "[+] Hostname: tlquan | User: truonglangquan"
     echo "[+] You may now unmount and reboot safely:"
     echo "[+]   umount -R /mnt/gentoo && reboot"
     echo "======================================================================"
