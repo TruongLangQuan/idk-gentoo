@@ -328,15 +328,29 @@ fetch_and_extract_stage3() {
         return 0
     fi
 
-    echo "[+] Resolving latest Stage3 OpenRC tarball URL..."
+    echo "[+] Resolving latest Stage3 OpenRC tarball URL from Gentoo mirrors..."
     cd "${MOUNT_POINT}"
 
-    local base_url="https://distfiles.gentoo.org/releases/amd64/autobuilds"
-    local txt_path
-    txt_path=$(curl -sSL "${base_url}/latest-stage3-amd64-desktop-openrc.txt" | grep '\.tar\.xz' | awk '{print $1}' | head -n 1)
+    local mirrors=(
+        "https://distfiles.gentoo.org/releases/amd64/autobuilds"
+        "https://mirror.rackspace.com/gentoo/releases/amd64/autobuilds"
+        "https://gentoo.osuosl.org/releases/amd64/autobuilds"
+    )
 
-    if [[ -z "${txt_path}" ]]; then
-        echo "[-] ERROR: Unable to locate stage3 archive path from distfiles." >&2
+    local base_url="" txt_path=""
+    local mirror
+    for mirror in "${mirrors[@]}"; do
+        echo "[*] Querying mirror: ${mirror}..."
+        txt_path=$(curl -fL --connect-timeout 10 -s "${mirror}/latest-stage3-amd64-desktop-openrc.txt" | grep '\.tar\.xz' | awk '{print $1}' | head -n 1 || true)
+        if [[ -n "${txt_path}" ]]; then
+            base_url="${mirror}"
+            echo "[+] Successfully resolved stage3 path via ${mirror}"
+            break
+        fi
+    done
+
+    if [[ -z "${txt_path}" ]] || [[ -z "${base_url}" ]]; then
+        echo "[-] ERROR: Unable to locate stage3 archive path from any Gentoo mirror!" >&2
         rollback_and_exit 1 $LINENO
     fi
 
@@ -344,11 +358,16 @@ fetch_and_extract_stage3() {
     local full_tarball_url="${base_url}/${txt_path}"
     local sha256_url="${full_tarball_url}.sha256"
 
-    echo "[+] Downloading Stage3 tarball: ${tarball_filename}..."
-    curl -sSL -C - -O "${full_tarball_url}" || wget -c "${full_tarball_url}"
+    echo "[+] Stage3 Tarball Target: ${tarball_filename}"
+    echo "[+] Downloading ${tarball_filename} (Live progress bar enabled)..."
 
-    echo "[+] Downloading checksums..."
-    curl -sSL -O "${sha256_url}" || wget -O "${tarball_filename}.sha256" "${sha256_url}" || true
+    if ! curl -fL -C - --connect-timeout 20 --retry 5 --retry-delay 3 --progress-bar -O "${full_tarball_url}"; then
+        echo "[!] Curl download failed/interrupted. Attempting fallback with wget..."
+        wget -c --connect-timeout=20 --tries=5 "${full_tarball_url}" || rollback_and_exit 1 $LINENO
+    fi
+
+    echo "[+] Downloading SHA256 checksum..."
+    curl -fL --connect-timeout 10 -s -O "${sha256_url}" || wget -O "${tarball_filename}.sha256" "${sha256_url}" || true
 
     echo "[+] Verifying SHA256 checksum integrity..."
     local verification_passed=0
@@ -361,7 +380,7 @@ fetch_and_extract_stage3() {
     if [[ -z "${expected_sha256}" ]]; then
         echo "[!] Fetching fallback DIGESTS..."
         local digests_url="${base_url}/${txt_path%/*}/DIGESTS"
-        curl -sSL -O "${digests_url}" || true
+        curl -fL --connect-timeout 10 -s -O "${digests_url}" || true
         if [[ -f "DIGESTS" ]]; then
             expected_sha256=$(grep -A 1 "# SHA256 HASH" DIGESTS 2>/dev/null | grep "${tarball_filename}" | awk '{print $1}' | head -n 1)
         fi
