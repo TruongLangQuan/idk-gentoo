@@ -57,7 +57,7 @@ fi
 # 3. Download and Extract Stage 3
 echo "[3/8] Fetching the latest Stage 3 tarball..."
 cd $MNT
-STAGE3_PATH=$(wget -qO- https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt | grep -v "^#" | awk '{print $1}')
+STAGE3_PATH=$(wget -qO- https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt | awk '/\.tar\.xz / {print $1}')
 STAGE3_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds/${STAGE3_PATH}"
 wget $STAGE3_URL -O stage3.tar.xz
 tar xpvf stage3.tar.xz --xattrs-include='*.*' --numeric-owner
