@@ -42,12 +42,17 @@ mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@tm
 
 # 2. Setup 16GB Swapfile
 echo "[2/8] Creating 16GB Swapfile..."
-truncate -s 0 $MNT/swap/swapfile
-chattr +C $MNT/swap/swapfile
-btrfs property set $MNT/swap/swapfile compression none
-dd if=/dev/zero of=$MNT/swap/swapfile bs=1M count=16384 status=progress
-chmod 600 $MNT/swap/swapfile
-mkswap $MNT/swap/swapfile
+if btrfs filesystem mkswapfile --size 16G --uuid clear $MNT/swap/swapfile; then
+    echo "Swapfile created successfully using native btrfs command."
+else
+    echo "Falling back to manual swapfile creation..."
+    truncate -s 0 $MNT/swap/swapfile
+    chattr +C $MNT/swap/swapfile
+    btrfs property set $MNT/swap/swapfile compression none || true
+    dd if=/dev/zero of=$MNT/swap/swapfile bs=1M count=16384 status=progress
+    chmod 600 $MNT/swap/swapfile
+    mkswap $MNT/swap/swapfile
+fi
 
 # 3. Download and Extract Stage 3
 echo "[3/8] Fetching the latest Stage 3 tarball..."
