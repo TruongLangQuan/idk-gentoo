@@ -103,7 +103,8 @@ FFLAGS="${COMMON_FLAGS}"
 MAKEOPTS="-j8 -l8"
 EMERGE_DEFAULT_OPTS="--jobs=8 --load-average=8.0 --autounmask=y --autounmask-write=y --autounmask-continue=y"
 ACCEPT_KEYWORDS="~amd64"
-USE="wayland dbus udev alsa vulkan bluetooth pipewire pulseaudio -X -gnome -kde -systemd -consolekit"
+# Aggressively stripped down USE flags to keep RAM usage minimal
+USE="wayland dbus udev alsa vulkan bluetooth pipewire pulseaudio minimal -X -gnome -kde -systemd -consolekit -cups -nls -ipv6 -polkit -udisks -telemetry -debug"
 VIDEO_CARDS="intel iris"
 INPUT_DEVICES="libinput"
 GENTOO_MIRRORS="https://gentoo.osuosl.org/"
@@ -138,7 +139,15 @@ rc-update add alsasound boot
 # User Setup
 echo "--> Setting up users"
 echo "root:15031169" | chpasswd
-useradd -m -G users,wheel,video,audio,usb,input -s /bin/bash truonglangquan
+auto_emerge app-admin/sudo
+echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
+
+echo "--> Creating tlquan (Admin)"
+useradd -m -G wheel -s /bin/bash tlquan
+echo "tlquan:15031169" | chpasswd
+
+echo "--> Creating truonglangquan (Normal User with full hardware groups)"
+useradd -m -G users,video,audio,usb,input,plugdev,kvm,cdrom -s /bin/bash truonglangquan
 echo "truonglangquan:15031169" | chpasswd
 
 # Bootloader setup
