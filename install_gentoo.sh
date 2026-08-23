@@ -32,7 +32,7 @@ umount $MNT
 
 # Remount with optimizations
 mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@ $GENTOO_PART $MNT
-mkdir -p $MNT/{home,swap,var/cache,var/cache/pacman/pkg,var/log,tmp,.snapshots,boot/efi}
+mkdir -p $MNT/{home,swap,var/cache,var/cache/pacman/pkg,var/log,tmp,.snapshots,boot}
 
 mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@home $GENTOO_PART $MNT/home
 mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@swap $GENTOO_PART $MNT/swap
@@ -65,7 +65,7 @@ tar xpvf stage3.tar.xz --xattrs-include='*.*' --numeric-owner
 # 4. Mount EFI and prepare Chroot
 echo "[4/8] Preparing Chroot Environment..."
 cp --dereference /etc/resolv.conf $MNT/etc/
-mount $EFI_PART $MNT/boot/efi
+mount $EFI_PART $MNT/boot
 mount --types proc /proc $MNT/proc
 mount --rbind /sys $MNT/sys
 mount --make-rslave $MNT/sys
@@ -79,7 +79,7 @@ echo "[5/8] Generating /etc/fstab..."
 G_UUID=$(blkid -s UUID -o value $GENTOO_PART)
 E_UUID=$(blkid -s UUID -o value $EFI_PART)
 cat <<EOF > $MNT/etc/fstab
-UUID=$E_UUID /boot/efi vfat rw,relatime 0 2
+UUID=$E_UUID /boot vfat rw,relatime 0 2
 UUID=$G_UUID / btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@ 0 0
 UUID=$G_UUID /home btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@home 0 0
 UUID=$G_UUID /var/log btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@log 0 0
@@ -126,7 +126,7 @@ auto_emerge sys-kernel/zen-sources sys-kernel/genkernel sys-apps/pciutils
 
 echo "--> Building Zen Kernel (This will take a while...)"
 eselect kernel set 1
-genkernel all
+genkernel --menuconfig all
 
 echo "--> Installing Networking, Bluetooth & Sound drivers"
 auto_emerge net-misc/networkmanager net-wireless/bluez media-video/pipewire media-sound/alsa-utils
@@ -155,7 +155,7 @@ echo "--> Installing GRUB"
 auto_emerge sys-boot/grub sys-boot/os-prober
 echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
 
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=gentoo
+grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=gentoo
 grub-mkconfig -o /boot/grub/grub.cfg
 
 EOF
