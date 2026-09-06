@@ -11,8 +11,16 @@ MNT="/mnt/gentoo"
 
 echo "========================================="
 echo "🚀 Starting Gentoo Installation"
-echo "Target: $GENTOO_PART"
-echo "EFI: $EFI_PART"
+
+echo "[0/8] Verifying Network Connection..."
+ping -c 3 distfiles.gentoo.org || { echo "ERROR: No network! Please connect to the internet first."; exit 1; }
+
+echo "[0.1/8] Secure Password Setup"
+read -s -p "Enter a secure password for your users (root, tlquan, truonglangquan): " USER_PASS
+echo
+read -s -p "Confirm password: " USER_PASS_CONFIRM
+echo
+if [ "$USER_PASS" != "$USER_PASS_CONFIRM" ]; then echo "Passwords do not match!"; exit 1; fi
 echo "========================================="
 
 # 1. Format and Create Subvolumes
@@ -39,6 +47,7 @@ mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@sw
 mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@cache $GENTOO_PART $MNT/var/cache
 mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@log $GENTOO_PART $MNT/var/log
 mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@tmp $GENTOO_PART $MNT/tmp
+mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@snapshots $GENTOO_PART $MNT/.snapshots
 
 # 2. Setup 16GB Swapfile
 echo "[2/8] Creating 16GB Swapfile..."
@@ -60,6 +69,14 @@ cd $MNT
 STAGE3_PATH=$(wget -qO- https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt | awk '/\.tar\.xz / {print $1}')
 STAGE3_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds/${STAGE3_PATH}"
 wget $STAGE3_URL -O stage3.tar.xz
+wget "${STAGE3_URL}.DIGESTS" -O stage3.tar.xz.DIGESTS
+EXPECTED_HASH=$(grep -A 1 "# SHA512 HASH" stage3.tar.xz.DIGESTS | grep "\.tar\.xz" | awk '{print $1}')
+CALCULATED_HASH=$(sha512sum stage3.tar.xz | awk '{print $1}')
+if [ "$EXPECTED_HASH" != "$CALCULATED_HASH" ]; then
+    echo "🔴 CRITICAL ERROR: Stage3 checksum verification failed! Download is corrupt."
+    exit 1
+fi
+echo "✅ Stage3 checksum verified successfully."
 tar xpvf stage3.tar.xz --xattrs-include='*.*' --numeric-owner
 
 # 4. Mount EFI and prepare Chroot
@@ -85,8 +102,13 @@ UUID=$G_UUID /home btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cach
 UUID=$G_UUID /var/log btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@log 0 0
 UUID=$G_UUID /var/cache btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@cache 0 0
 UUID=$G_UUID /swap btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@swap 0 0
+UUID=$G_UUID /.snapshots btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@snapshots 0 0
 /swap/swapfile none swap defaults 0 0
 EOF
+
+# Export password securely to temp file
+echo "$USER_PASS" > $MNT/tmp/secure_pass.txt
+chmod 600 $MNT/tmp/secure_pass.txt
 
 # 6. Execute Chroot Script
 echo "[6/8] Entering Chroot to install packages and kernel..."
@@ -139,18 +161,20 @@ rc-update add alsasound boot
 
 # User Setup
 echo "--> Setting up users"
-echo "root:15031169" | chpasswd
+PASS=$(cat /tmp/secure_pass.txt)
+echo "root:$PASS" | chpasswd
 auto_emerge app-admin/sudo
 echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
 
 echo "--> Creating tlquan (Admin)"
 useradd -m -G wheel -s /bin/bash tlquan
-echo "tlquan:15031169" | chpasswd
+echo "tlquan:$PASS" | chpasswd
 
 echo "--> Creating truonglangquan (Normal User with full hardware groups)"
 for g in users video audio usb input plugdev kvm cdrom; do groupadd -f $g || true; done
 useradd -m -G users,video,audio,usb,input,plugdev,kvm,cdrom -s /bin/bash truonglangquan
-echo "truonglangquan:15031169" | chpasswd
+echo "truonglangquan:$PASS" | chpasswd
+rm -f /tmp/secure_pass.txt
 
 # Bootloader setup
 echo "--> Installing GRUB"
@@ -164,6 +188,7 @@ EOF
 
 # 7. Unmount & Cleanup
 echo "[7/8] Cleaning up and Unmounting..."
+sync
 umount -l $MNT/dev{/shm,/pts,}
 umount -R $MNT
 
