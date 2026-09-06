@@ -91,6 +91,7 @@ EOF
 # 6. Execute Chroot Script
 echo "[6/8] Entering Chroot to install packages and kernel..."
 chroot $MNT /bin/bash << 'EOF'
+set -e
 source /etc/profile
 
 # Write optimized make.conf
@@ -103,8 +104,8 @@ FFLAGS="${COMMON_FLAGS}"
 MAKEOPTS="-j8 -l8"
 EMERGE_DEFAULT_OPTS="--jobs=8 --load-average=8.0 --autounmask=y --autounmask-write=y --autounmask-continue=y"
 ACCEPT_KEYWORDS="~amd64"
-# Aggressively stripped down USE flags to keep RAM usage minimal
-USE="wayland dbus udev alsa vulkan bluetooth pipewire pulseaudio minimal -X -gnome -kde -systemd -consolekit -cups -nls -ipv6 -polkit -udisks -telemetry -debug"
+# Aggressively stripped down USE flags to keep RAM usage minimal. Added networkmanager and wifi for AX210.
+USE="wayland dbus udev alsa vulkan bluetooth pipewire pulseaudio minimal networkmanager wifi -X -gnome -kde -systemd -consolekit -cups -nls -ipv6 -polkit -udisks -telemetry -debug"
 VIDEO_CARDS="intel iris"
 INPUT_DEVICES="libinput"
 GENTOO_MIRRORS="https://gentoo.osuosl.org/"
@@ -147,6 +148,7 @@ useradd -m -G wheel -s /bin/bash tlquan
 echo "tlquan:15031169" | chpasswd
 
 echo "--> Creating truonglangquan (Normal User with full hardware groups)"
+for g in users video audio usb input plugdev kvm cdrom; do groupadd -f $g || true; done
 useradd -m -G users,video,audio,usb,input,plugdev,kvm,cdrom -s /bin/bash truonglangquan
 echo "truonglangquan:15031169" | chpasswd
 
