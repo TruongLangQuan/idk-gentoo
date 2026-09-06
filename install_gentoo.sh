@@ -62,22 +62,24 @@ else
     chmod 600 $MNT/swap/swapfile
     mkswap $MNT/swap/swapfile
 fi
+# Enable swap during install so compilation doesn't run out of memory
+swapon $MNT/swap/swapfile
 
 # 3. Download and Extract Stage 3
 echo "[3/8] Fetching the latest Stage 3 tarball..."
 cd $MNT
 STAGE3_PATH=$(wget -qO- https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt | awk '/\.tar\.xz / {print $1}')
 STAGE3_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds/${STAGE3_PATH}"
-wget $STAGE3_URL -O stage3.tar.xz
-wget "${STAGE3_URL}.DIGESTS" -O stage3.tar.xz.DIGESTS
+wget $STAGE3_URL -O stage3.tar.xz || { echo "Failed to download stage3"; exit 1; }
+wget "${STAGE3_URL}.DIGESTS" -O stage3.tar.xz.DIGESTS || { echo "Failed to download digests"; exit 1; }
 EXPECTED_HASH=$(grep -A 1 "# SHA512 HASH" stage3.tar.xz.DIGESTS | grep "\.tar\.xz" | awk '{print $1}')
 CALCULATED_HASH=$(sha512sum stage3.tar.xz | awk '{print $1}')
-if [ "$EXPECTED_HASH" != "$CALCULATED_HASH" ]; then
+if [ -z "$EXPECTED_HASH" ] || [ "$EXPECTED_HASH" != "$CALCULATED_HASH" ]; then
     echo "🔴 CRITICAL ERROR: Stage3 checksum verification failed! Download is corrupt."
     exit 1
 fi
 echo "✅ Stage3 checksum verified successfully."
-tar xpvf stage3.tar.xz --xattrs-include='*.*' --numeric-owner
+tar xpvf stage3.tar.xz --xattrs-include='*.*' --numeric-owner || { echo "Failed to extract tarball"; exit 1; }
 
 # 4. Mount EFI and prepare Chroot
 echo "[4/8] Preparing Chroot Environment..."
@@ -103,16 +105,13 @@ UUID=$G_UUID /var/log btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_c
 UUID=$G_UUID /var/cache btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@cache 0 0
 UUID=$G_UUID /swap btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@swap 0 0
 UUID=$G_UUID /.snapshots btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@snapshots 0 0
-/swap/swapfile none swap defaults 0 0
+/swap/swapfile none swap sw 0 0
 EOF
-
-# Export password securely to temp file
-echo "$USER_PASS" > $MNT/tmp/secure_pass.txt
-chmod 600 $MNT/tmp/secure_pass.txt
 
 # 6. Execute Chroot Script
 echo "[6/8] Entering Chroot to install packages and kernel..."
-chroot $MNT /bin/bash << 'EOF'
+# Pass password securely via environment variables to avoid writing it to disk
+env PASS="$USER_PASS" chroot $MNT /bin/bash << 'EOF'
 set -e
 source /etc/profile
 
@@ -161,7 +160,6 @@ rc-update add alsasound boot
 
 # User Setup
 echo "--> Setting up users"
-PASS=$(cat /tmp/secure_pass.txt)
 echo "root:$PASS" | chpasswd
 auto_emerge app-admin/sudo
 echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
@@ -174,7 +172,6 @@ echo "--> Creating truonglangquan (Normal User with full hardware groups)"
 for g in users video audio usb input plugdev kvm cdrom; do groupadd -f $g || true; done
 useradd -m -G users,video,audio,usb,input,plugdev,kvm,cdrom -s /bin/bash truonglangquan
 echo "truonglangquan:$PASS" | chpasswd
-rm -f /tmp/secure_pass.txt
 
 # Bootloader setup
 echo "--> Installing GRUB"
@@ -189,8 +186,8 @@ EOF
 # 7. Unmount & Cleanup
 echo "[7/8] Cleaning up and Unmounting..."
 sync
-umount -l $MNT/dev{/shm,/pts,}
-umount -R $MNT
+swapoff $MNT/swap/swapfile || true
+umount -R $MNT || true
 
 echo "========================================="
 echo "✅ Installation Complete!"
