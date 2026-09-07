@@ -151,7 +151,13 @@ auto_emerge sys-kernel/zen-sources sys-kernel/genkernel sys-apps/pciutils
 
 echo "--> Building Zen Kernel (Automated)..."
 eselect kernel set 1
-genkernel all
+if wget -q https://raw.githubusercontent.com/TruongLangQuan/idk-gentoo/main/kernel.config -O /kernel.config; then
+    echo "Found custom kernel.config in GitHub repo! Using it for genkernel..."
+    genkernel --kernel-config=/kernel.config all
+else
+    echo "No custom kernel.config found. Building with default Zen configuration..."
+    genkernel all
+fi
 
 echo "--> Installing Networking, Bluetooth & Sound drivers"
 auto_emerge net-misc/networkmanager net-wireless/bluez media-video/pipewire media-sound/alsa-utils
