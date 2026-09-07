@@ -124,13 +124,16 @@ FCFLAGS="${COMMON_FLAGS}"
 FFLAGS="${COMMON_FLAGS}"
 MAKEOPTS="-j8 -l8"
 EMERGE_DEFAULT_OPTS="--jobs=8 --load-average=8.0 --autounmask=y --autounmask-write=y --autounmask-continue=y"
-ACCEPT_KEYWORDS="~amd64"
 # Aggressively stripped down USE flags to keep RAM usage minimal. Added networkmanager and wifi for AX210.
 USE="wayland dbus udev alsa vulkan bluetooth pipewire pulseaudio minimal networkmanager wifi -X -gnome -kde -systemd -consolekit -cups -nls -ipv6 -polkit -udisks -telemetry -debug"
 VIDEO_CARDS="intel iris"
 INPUT_DEVICES="libinput"
 GENTOO_MIRRORS="https://gentoo.osuosl.org/"
 MAKE_CONF
+
+# Explicitly unmask zen-sources to avoid making the whole system ~amd64
+mkdir -p /etc/portage/package.accept_keywords
+echo "sys-kernel/zen-sources ~amd64" > /etc/portage/package.accept_keywords/zen-sources
 
 # Sync portage securely
 emerge-webrsync
@@ -146,10 +149,9 @@ auto_emerge sys-kernel/linux-firmware sys-firmware/intel-microcode sys-fs/btrfs-
 echo "--> Installing Zen Kernel Sources & Genkernel"
 auto_emerge sys-kernel/zen-sources sys-kernel/genkernel sys-apps/pciutils
 
-echo "--> Building Zen Kernel (This will take a while...)"
+echo "--> Building Zen Kernel (Automated)..."
 eselect kernel set 1
-# Redirect /dev/tty so menuconfig can read keyboard input inside the here-doc
-genkernel --menuconfig all < /dev/tty > /dev/tty
+genkernel all
 
 echo "--> Installing Networking, Bluetooth & Sound drivers"
 auto_emerge net-misc/networkmanager net-wireless/bluez media-video/pipewire media-sound/alsa-utils
