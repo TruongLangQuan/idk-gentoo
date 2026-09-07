@@ -72,7 +72,7 @@ STAGE3_PATH=$(wget -qO- https://distfiles.gentoo.org/releases/amd64/autobuilds/l
 STAGE3_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds/${STAGE3_PATH}"
 wget $STAGE3_URL -O stage3.tar.xz || { echo "Failed to download stage3"; exit 1; }
 wget "${STAGE3_URL}.DIGESTS" -O stage3.tar.xz.DIGESTS || { echo "Failed to download digests"; exit 1; }
-EXPECTED_HASH=$(grep -A 1 "# SHA512 HASH" stage3.tar.xz.DIGESTS | grep "\.tar\.xz" | awk '{print $1}')
+EXPECTED_HASH=$(grep -A 1 "# SHA512 HASH" stage3.tar.xz.DIGESTS | grep "\.tar\.xz" | grep -v "CONTENTS" | awk '{print $1}')
 CALCULATED_HASH=$(sha512sum stage3.tar.xz | awk '{print $1}')
 if [ -z "$EXPECTED_HASH" ] || [ "$EXPECTED_HASH" != "$CALCULATED_HASH" ]; then
     echo "🔴 CRITICAL ERROR: Stage3 checksum verification failed! Download is corrupt."
