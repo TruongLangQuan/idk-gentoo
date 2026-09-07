@@ -148,7 +148,8 @@ auto_emerge sys-kernel/zen-sources sys-kernel/genkernel sys-apps/pciutils
 
 echo "--> Building Zen Kernel (This will take a while...)"
 eselect kernel set 1
-genkernel --menuconfig all
+# Redirect /dev/tty so menuconfig can read keyboard input inside the here-doc
+genkernel --menuconfig all < /dev/tty > /dev/tty
 
 echo "--> Installing Networking, Bluetooth & Sound drivers"
 auto_emerge net-misc/networkmanager net-wireless/bluez media-video/pipewire media-sound/alsa-utils
