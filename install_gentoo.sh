@@ -19,6 +19,17 @@ echo "[0/8] Verifying Network Connection..."
 # Disable IPv6 to prevent broken IPv6 routes from causing 180s connection timeouts
 sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>/dev/null || true
 sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
+
+# Disable Wi-Fi power management so Intel AX210 radio doesn't sleep during long compile
+for iface in $(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'); do
+    iw dev "$iface" set power_save off 2>/dev/null || true
+done
+
+# Background keepalive ping to prevent Wi-Fi lease / router timeout during 30min kernel build
+( while true; do ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || true; sleep 15; done ) &
+KEEPALIVE_PID=$!
+trap 'kill $KEEPALIVE_PID 2>/dev/null || true' EXIT
+
 ping -c 3 distfiles.gentoo.org || { echo "ERROR: No network! Please connect to the internet first."; exit 1; }
 
 echo "[0.1/8] Password setup"
@@ -101,9 +112,13 @@ tar xpvf stage3.tar.xz --xattrs-include='*.*' --numeric-owner || { echo "Failed 
 
 # 4. Mount EFI and prepare Chroot
 echo "[4/8] Preparing Chroot Environment..."
-cp --dereference /etc/resolv.conf "$MNT/etc/"
-grep -q "nameserver 1.1.1.1" "$MNT/etc/resolv.conf" 2>/dev/null || echo "nameserver 1.1.1.1" >> "$MNT/etc/resolv.conf"
-grep -q "nameserver 8.8.8.8" "$MNT/etc/resolv.conf" 2>/dev/null || echo "nameserver 8.8.8.8" >> "$MNT/etc/resolv.conf"
+# Configure fast and reliable public DNS inside chroot
+cp --dereference /etc/resolv.conf "$MNT/etc/resolv.conf.orig" 2>/dev/null || true
+cat << 'RESOLV' > "$MNT/etc/resolv.conf"
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 9.9.9.9
+RESOLV
 mount "$EFI_PART" "$MNT/boot"
 mount --types proc /proc "$MNT/proc"
 mount --rbind /sys "$MNT/sys"
@@ -151,7 +166,7 @@ ACCEPT_LICENSE="*"
 USE="wayland dbus udev alsa vulkan bluetooth pipewire pulseaudio networkmanager wifi btrfs -X -gnome -kde -systemd -consolekit -cups -nls -ipv6 -polkit -udisks -telemetry -debug"
 VIDEO_CARDS="intel iris"
 INPUT_DEVICES="libinput"
-GENTOO_MIRRORS="https://gentoo.osuosl.org/"
+GENTOO_MIRRORS="https://distfiles.gentoo.org/ https://gentoo.osuosl.org/ http://mirror.leaseweb.com/gentoo/"
 MAKE_CONF
 
 # Explicitly unmask zen-sources to avoid making the whole system ~amd64
@@ -166,9 +181,15 @@ echo ">=dev-lang/perl-5.44" > /etc/portage/package.mask/perl
 echo "--> Syncing Portage tree..."
 emerge-webrsync --no-pgp-verify || emerge --sync
 
-# Helper function to auto-update configs and resolve slot/dependency conflicts cleanly
+# Helper function to auto-update configs without upgrading unrelated system packages
 auto_emerge() {
-    emerge -uNDq --backtrack=100 "$@" || { echo "Applying autounmask changes..."; etc-update --automode -5; emerge -uNDq --backtrack=100 "$@"; }
+    # Wait for network if Wi-Fi temporarily stalled
+    if ! ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
+        echo "⚠️ Waiting for network connectivity..."
+        until ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; do sleep 2; done
+        echo "✅ Network connection active."
+    fi
+    emerge -q --changed-use --backtrack=100 "$@" || { echo "Applying autounmask changes..."; etc-update --automode -5; emerge -q --changed-use --backtrack=100 "$@"; }
 }
 
 echo "--> Installing Firmware & Base Tools"
