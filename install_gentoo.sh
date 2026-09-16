@@ -24,6 +24,9 @@ echo "========================================="
 
 # 1. Format and Create Subvolumes
 echo "[1/8] Formatting $GENTOO_PART to BTRFS and creating subvolumes..."
+swapoff -a 2>/dev/null || true
+umount -R "$MNT" 2>/dev/null || true
+mkdir -p "$MNT"
 mkfs.btrfs -f "$GENTOO_PART"
 mount "$GENTOO_PART" "$MNT"
 
@@ -31,7 +34,6 @@ btrfs subvolume create "$MNT/@"
 btrfs subvolume create "$MNT/@home"
 btrfs subvolume create "$MNT/@swap"
 btrfs subvolume create "$MNT/@cache"
-btrfs subvolume create "$MNT/@pkg"
 btrfs subvolume create "$MNT/@log"
 btrfs subvolume create "$MNT/@tmp"
 btrfs subvolume create "$MNT/@snapshots"
@@ -39,7 +41,7 @@ umount "$MNT"
 
 # Remount with optimizations
 mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@ "$GENTOO_PART" "$MNT"
-mkdir -p "$MNT"/{home,swap,var/cache,var/cache/pacman/pkg,var/log,tmp,.snapshots,boot}
+mkdir -p "$MNT"/{home,swap,var/cache,var/log,tmp,.snapshots,boot}
 
 mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@home "$GENTOO_PART" "$MNT/home"
 mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@swap "$GENTOO_PART" "$MNT/swap"
@@ -102,6 +104,7 @@ UUID=$G_UUID / btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2
 UUID=$G_UUID /home btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@home 0 0
 UUID=$G_UUID /var/log btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@log 0 0
 UUID=$G_UUID /var/cache btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@cache 0 0
+UUID=$G_UUID /tmp btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@tmp 0 0
 UUID=$G_UUID /swap btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@swap 0 0
 UUID=$G_UUID /.snapshots btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@snapshots 0 0
 /swap/swapfile none swap sw 0 0
@@ -116,17 +119,17 @@ source /etc/profile
 
 # Write optimized make.conf
 cat << 'MAKE_CONF' > /etc/portage/make.conf
-COMMON_FLAGS="-march=tigerlake -O2 -pipe -flto"
+COMMON_FLAGS="-march=tigerlake -O2 -pipe"
 CFLAGS="${COMMON_FLAGS}"
 CXXFLAGS="${COMMON_FLAGS}"
 FCFLAGS="${COMMON_FLAGS}"
 FFLAGS="${COMMON_FLAGS}"
 MAKEOPTS="-j8 -l8"
 EMERGE_DEFAULT_OPTS="--jobs=8 --load-average=8.0 --autounmask=y --autounmask-write=y --autounmask-continue=y"
-# Accept all licenses except EULAs, so linux-firmware / intel-microcode install unattended
-ACCEPT_LICENSE="* -@EULA"
-# Aggressively stripped down USE flags to keep RAM usage minimal. Added networkmanager for AX210.
-USE="wayland dbus udev alsa vulkan bluetooth pipewire pulseaudio minimal networkmanager -X -gnome -kde -systemd -consolekit -cups -nls -ipv6 -polkit -udisks -telemetry -debug"
+GRUB_PLATFORMS="efi-64"
+ACCEPT_LICENSE="*"
+# Stripped down USE flags for low RAM, BTRFS root, and Intel AX210 wifi/bluetooth
+USE="wayland dbus udev alsa vulkan bluetooth pipewire pulseaudio networkmanager wifi btrfs -X -gnome -kde -systemd -consolekit -cups -nls -ipv6 -polkit -udisks -telemetry -debug"
 VIDEO_CARDS="intel iris"
 INPUT_DEVICES="libinput"
 GENTOO_MIRRORS="https://gentoo.osuosl.org/"
@@ -152,18 +155,20 @@ auto_emerge sys-kernel/zen-sources sys-kernel/genkernel sys-apps/pciutils
 
 echo "--> Building Zen Kernel (Automated)..."
 eselect kernel set 1
-if wget -q https://raw.githubusercontent.com/TruongLangQuan/idk-gentoo/main/kernel.config -O /kernel.config; then
+if wget -q https://raw.githubusercontent.com/TruongLangQuan/idk-gentoo/main/kernel.config -O /tmp/kernel.config && [ -s /tmp/kernel.config ]; then
     echo "Found custom kernel.config in GitHub repo! Using it for genkernel..."
-    genkernel --kernel-config=/kernel.config all
+    genkernel --kernel-config=/tmp/kernel.config --btrfs --microcode=intel all
 else
+    rm -f /tmp/kernel.config
     echo "No custom kernel.config found. Building with default Zen configuration..."
-    genkernel all
+    genkernel --btrfs --microcode=intel all
 fi
 
 echo "--> Installing Networking, Bluetooth & Sound drivers"
 auto_emerge net-misc/networkmanager net-wireless/bluez media-video/pipewire media-sound/alsa-utils
 
 # Enable services
+rc-update add dbus default
 rc-update add NetworkManager default
 rc-update add bluetooth default
 rc-update add alsasound boot
@@ -175,18 +180,25 @@ auto_emerge app-admin/sudo
 echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
 
 echo "--> Creating tlquan (Admin)"
-useradd -m -G wheel -s /bin/bash tlquan
+id -u tlquan &>/dev/null || useradd -m -G wheel -s /bin/bash tlquan
 echo "tlquan:$PASS" | chpasswd
 
 echo "--> Creating truonglangquan (Normal User with full hardware groups)"
 for g in users video audio usb input plugdev kvm cdrom; do groupadd -f "$g" || true; done
-useradd -m -G users,video,audio,usb,input,plugdev,kvm,cdrom -s /bin/bash truonglangquan
+id -u truonglangquan &>/dev/null || useradd -m -G users,video,audio,usb,input,plugdev,kvm,cdrom -s /bin/bash truonglangquan
 echo "truonglangquan:$PASS" | chpasswd
 
 # Bootloader setup
 echo "--> Installing GRUB"
+mkdir -p /etc/portage/package.use
+echo "sys-boot/grub mount" >> /etc/portage/package.use/grub
 auto_emerge sys-boot/grub sys-boot/os-prober
 echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
+if grep -q "^GRUB_CMDLINE_LINUX=" /etc/default/grub 2>/dev/null; then
+    sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 rootflags=subvol=\/@"/' /etc/default/grub
+else
+    echo 'GRUB_CMDLINE_LINUX="rootflags=subvol=/@"' >> /etc/default/grub
+fi
 
 grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=gentoo
 grub-mkconfig -o /boot/grub/grub.cfg
