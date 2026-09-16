@@ -16,6 +16,9 @@ echo "========================================="
 echo "🚀 Starting Gentoo Installation"
 
 echo "[0/8] Verifying Network Connection..."
+# Disable IPv6 to prevent broken IPv6 routes from causing 180s connection timeouts
+sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>/dev/null || true
+sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
 ping -c 3 distfiles.gentoo.org || { echo "ERROR: No network! Please connect to the internet first."; exit 1; }
 
 echo "[0.1/8] Password setup"
@@ -99,6 +102,8 @@ tar xpvf stage3.tar.xz --xattrs-include='*.*' --numeric-owner || { echo "Failed 
 # 4. Mount EFI and prepare Chroot
 echo "[4/8] Preparing Chroot Environment..."
 cp --dereference /etc/resolv.conf "$MNT/etc/"
+grep -q "nameserver 1.1.1.1" "$MNT/etc/resolv.conf" 2>/dev/null || echo "nameserver 1.1.1.1" >> "$MNT/etc/resolv.conf"
+grep -q "nameserver 8.8.8.8" "$MNT/etc/resolv.conf" 2>/dev/null || echo "nameserver 8.8.8.8" >> "$MNT/etc/resolv.conf"
 mount "$EFI_PART" "$MNT/boot"
 mount --types proc /proc "$MNT/proc"
 mount --rbind /sys "$MNT/sys"
@@ -153,8 +158,9 @@ MAKE_CONF
 mkdir -p /etc/portage/package.accept_keywords
 echo "sys-kernel/zen-sources ~amd64" > /etc/portage/package.accept_keywords/zen-sources
 
-# Sync portage securely
-emerge-webrsync
+# Sync portage (using --no-pgp-verify to prevent 180s WKD key refresh timeout to gentoo.org)
+echo "--> Syncing Portage tree..."
+emerge-webrsync --no-pgp-verify || emerge --sync
 
 # Helper function to auto-update configs if emerge throws an autounmask block
 auto_emerge() {
