@@ -144,7 +144,7 @@ CXXFLAGS="${COMMON_FLAGS}"
 FCFLAGS="${COMMON_FLAGS}"
 FFLAGS="${COMMON_FLAGS}"
 MAKEOPTS="-j8 -l8"
-EMERGE_DEFAULT_OPTS="--jobs=8 --load-average=8.0 --autounmask=y --autounmask-write=y --autounmask-continue=y"
+EMERGE_DEFAULT_OPTS="--jobs=8 --load-average=8.0 --autounmask=y --autounmask-write=y --autounmask-continue=y --backtrack=100"
 GRUB_PLATFORMS="efi-64"
 ACCEPT_LICENSE="*"
 # Stripped down USE flags for low RAM, BTRFS root, and Intel AX210 wifi/bluetooth
@@ -158,13 +158,17 @@ MAKE_CONF
 mkdir -p /etc/portage/package.accept_keywords
 echo "sys-kernel/zen-sources ~amd64" > /etc/portage/package.accept_keywords/zen-sources
 
+# Prevent major perl version bump during install to avoid slot conflict with stage3 virtuals
+mkdir -p /etc/portage/package.mask
+echo ">=dev-lang/perl-5.44" > /etc/portage/package.mask/perl
+
 # Sync portage (using --no-pgp-verify to prevent 180s WKD key refresh timeout to gentoo.org)
 echo "--> Syncing Portage tree..."
 emerge-webrsync --no-pgp-verify || emerge --sync
 
-# Helper function to auto-update configs if emerge throws an autounmask block
+# Helper function to auto-update configs and resolve slot/dependency conflicts cleanly
 auto_emerge() {
-    emerge -q "$@" || { echo "Applying autounmask changes..."; etc-update --automode -5; emerge -q "$@"; }
+    emerge -uNDq --backtrack=100 "$@" || { echo "Applying autounmask changes..."; etc-update --automode -5; emerge -uNDq --backtrack=100 "$@"; }
 }
 
 echo "--> Installing Firmware & Base Tools"
