@@ -2,6 +2,9 @@
 # Gentoo Unattended Installation Script for Thinkpad L13 Gen 2
 # WARNING: This script will format /dev/nvme0n1p3 to BTRFS!
 # It will NOT format your EFI partition (/dev/nvme0n1p1) or Artix partition (/dev/nvme0n1p2).
+#
+# Fully non-interactive: set USER_PASS before running, e.g.
+#   USER_PASS='your-password-here' ./install_gentoo.sh
 
 set -e
 
@@ -15,62 +18,58 @@ echo "🚀 Starting Gentoo Installation"
 echo "[0/8] Verifying Network Connection..."
 ping -c 3 distfiles.gentoo.org || { echo "ERROR: No network! Please connect to the internet first."; exit 1; }
 
-echo "[0.1/8] Secure Password Setup"
-read -s -p "Enter a secure password for your users (root, tlquan, truonglangquan): " USER_PASS
-echo
-read -s -p "Confirm password: " USER_PASS_CONFIRM
-echo
-if [ "$USER_PASS" != "$USER_PASS_CONFIRM" ]; then echo "Passwords do not match!"; exit 1; fi
+echo "[0.1/8] Password check"
+USER_PASS="${USER_PASS:?Set USER_PASS env var before running, e.g. USER_PASS='...' $0}"
 echo "========================================="
 
 # 1. Format and Create Subvolumes
 echo "[1/8] Formatting $GENTOO_PART to BTRFS and creating subvolumes..."
-mkfs.btrfs -f $GENTOO_PART
-mount $GENTOO_PART $MNT
+mkfs.btrfs -f "$GENTOO_PART"
+mount "$GENTOO_PART" "$MNT"
 
-btrfs subvolume create $MNT/@
-btrfs subvolume create $MNT/@home
-btrfs subvolume create $MNT/@swap
-btrfs subvolume create $MNT/@cache
-btrfs subvolume create $MNT/@pkg
-btrfs subvolume create $MNT/@log
-btrfs subvolume create $MNT/@tmp
-btrfs subvolume create $MNT/@snapshots
-umount $MNT
+btrfs subvolume create "$MNT/@"
+btrfs subvolume create "$MNT/@home"
+btrfs subvolume create "$MNT/@swap"
+btrfs subvolume create "$MNT/@cache"
+btrfs subvolume create "$MNT/@pkg"
+btrfs subvolume create "$MNT/@log"
+btrfs subvolume create "$MNT/@tmp"
+btrfs subvolume create "$MNT/@snapshots"
+umount "$MNT"
 
 # Remount with optimizations
-mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@ $GENTOO_PART $MNT
-mkdir -p $MNT/{home,swap,var/cache,var/cache/pacman/pkg,var/log,tmp,.snapshots,boot}
+mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@ "$GENTOO_PART" "$MNT"
+mkdir -p "$MNT"/{home,swap,var/cache,var/cache/pacman/pkg,var/log,tmp,.snapshots,boot}
 
-mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@home $GENTOO_PART $MNT/home
-mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@swap $GENTOO_PART $MNT/swap
-mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@cache $GENTOO_PART $MNT/var/cache
-mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@log $GENTOO_PART $MNT/var/log
-mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@tmp $GENTOO_PART $MNT/tmp
-mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@snapshots $GENTOO_PART $MNT/.snapshots
+mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@home "$GENTOO_PART" "$MNT/home"
+mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@swap "$GENTOO_PART" "$MNT/swap"
+mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@cache "$GENTOO_PART" "$MNT/var/cache"
+mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@log "$GENTOO_PART" "$MNT/var/log"
+mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@tmp "$GENTOO_PART" "$MNT/tmp"
+mount -o rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@snapshots "$GENTOO_PART" "$MNT/.snapshots"
 
 # 2. Setup 16GB Swapfile
 echo "[2/8] Creating 16GB Swapfile..."
-if btrfs filesystem mkswapfile --size 16G --uuid clear $MNT/swap/swapfile; then
+if btrfs filesystem mkswapfile --size 16G --uuid clear "$MNT/swap/swapfile"; then
     echo "Swapfile created successfully using native btrfs command."
 else
     echo "Falling back to manual swapfile creation..."
-    truncate -s 0 $MNT/swap/swapfile
-    chattr +C $MNT/swap/swapfile
-    btrfs property set $MNT/swap/swapfile compression none || true
-    dd if=/dev/zero of=$MNT/swap/swapfile bs=1M count=16384 status=progress
-    chmod 600 $MNT/swap/swapfile
-    mkswap $MNT/swap/swapfile
+    truncate -s 0 "$MNT/swap/swapfile"
+    chattr +C "$MNT/swap/swapfile"
+    btrfs property set "$MNT/swap/swapfile" compression none || true
+    dd if=/dev/zero of="$MNT/swap/swapfile" bs=1M count=16384 status=progress
+    chmod 600 "$MNT/swap/swapfile"
+    mkswap "$MNT/swap/swapfile"
 fi
 # Enable swap during install so compilation doesn't run out of memory
-swapon $MNT/swap/swapfile
+swapon "$MNT/swap/swapfile"
 
 # 3. Download and Extract Stage 3
 echo "[3/8] Fetching the latest Stage 3 tarball..."
-cd $MNT
+cd "$MNT"
 STAGE3_PATH=$(wget -qO- https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-openrc.txt | awk '/\.tar\.xz / {print $1}')
 STAGE3_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds/${STAGE3_PATH}"
-wget $STAGE3_URL -O stage3.tar.xz || { echo "Failed to download stage3"; exit 1; }
+wget "$STAGE3_URL" -O stage3.tar.xz || { echo "Failed to download stage3"; exit 1; }
 wget "${STAGE3_URL}.DIGESTS" -O stage3.tar.xz.DIGESTS || { echo "Failed to download digests"; exit 1; }
 EXPECTED_HASH=$(grep -A 1 "# SHA512 HASH" stage3.tar.xz.DIGESTS | grep "\.tar\.xz" | grep -v "CONTENTS" | awk '{print $1}')
 CALCULATED_HASH=$(sha512sum stage3.tar.xz | awk '{print $1}')
@@ -83,21 +82,21 @@ tar xpvf stage3.tar.xz --xattrs-include='*.*' --numeric-owner || { echo "Failed 
 
 # 4. Mount EFI and prepare Chroot
 echo "[4/8] Preparing Chroot Environment..."
-cp --dereference /etc/resolv.conf $MNT/etc/
-mount $EFI_PART $MNT/boot
-mount --types proc /proc $MNT/proc
-mount --rbind /sys $MNT/sys
-mount --make-rslave $MNT/sys
-mount --rbind /dev $MNT/dev
-mount --make-rslave $MNT/dev
-mount --bind /run $MNT/run
-mount --make-slave $MNT/run
+cp --dereference /etc/resolv.conf "$MNT/etc/"
+mount "$EFI_PART" "$MNT/boot"
+mount --types proc /proc "$MNT/proc"
+mount --rbind /sys "$MNT/sys"
+mount --make-rslave "$MNT/sys"
+mount --rbind /dev "$MNT/dev"
+mount --make-rslave "$MNT/dev"
+mount --bind /run "$MNT/run"
+mount --make-slave "$MNT/run"
 
 # 5. Generate /etc/fstab dynamically using UUIDs
 echo "[5/8] Generating /etc/fstab..."
-G_UUID=$(blkid -s UUID -o value $GENTOO_PART)
-E_UUID=$(blkid -s UUID -o value $EFI_PART)
-cat <<EOF > $MNT/etc/fstab
+G_UUID=$(blkid -s UUID -o value "$GENTOO_PART")
+E_UUID=$(blkid -s UUID -o value "$EFI_PART")
+cat <<EOF > "$MNT/etc/fstab"
 UUID=$E_UUID /boot vfat rw,relatime 0 2
 UUID=$G_UUID / btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@ 0 0
 UUID=$G_UUID /home btrfs rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvol=/@home 0 0
@@ -111,7 +110,7 @@ EOF
 # 6. Execute Chroot Script
 echo "[6/8] Entering Chroot to install packages and kernel..."
 # Pass password securely via environment variables to avoid writing it to disk
-env PASS="$USER_PASS" chroot $MNT /bin/bash << 'EOF'
+env PASS="$USER_PASS" chroot "$MNT" /bin/bash << 'EOF'
 set -e
 source /etc/profile
 
@@ -124,8 +123,10 @@ FCFLAGS="${COMMON_FLAGS}"
 FFLAGS="${COMMON_FLAGS}"
 MAKEOPTS="-j8 -l8"
 EMERGE_DEFAULT_OPTS="--jobs=8 --load-average=8.0 --autounmask=y --autounmask-write=y --autounmask-continue=y"
-# Aggressively stripped down USE flags to keep RAM usage minimal. Added networkmanager and wifi for AX210.
-USE="wayland dbus udev alsa vulkan bluetooth pipewire pulseaudio minimal networkmanager wifi -X -gnome -kde -systemd -consolekit -cups -nls -ipv6 -polkit -udisks -telemetry -debug"
+# Accept all licenses except EULAs, so linux-firmware / intel-microcode install unattended
+ACCEPT_LICENSE="* -@EULA"
+# Aggressively stripped down USE flags to keep RAM usage minimal. Added networkmanager for AX210.
+USE="wayland dbus udev alsa vulkan bluetooth pipewire pulseaudio minimal networkmanager -X -gnome -kde -systemd -consolekit -cups -nls -ipv6 -polkit -udisks -telemetry -debug"
 VIDEO_CARDS="intel iris"
 INPUT_DEVICES="libinput"
 GENTOO_MIRRORS="https://gentoo.osuosl.org/"
@@ -178,7 +179,7 @@ useradd -m -G wheel -s /bin/bash tlquan
 echo "tlquan:$PASS" | chpasswd
 
 echo "--> Creating truonglangquan (Normal User with full hardware groups)"
-for g in users video audio usb input plugdev kvm cdrom; do groupadd -f $g || true; done
+for g in users video audio usb input plugdev kvm cdrom; do groupadd -f "$g" || true; done
 useradd -m -G users,video,audio,usb,input,plugdev,kvm,cdrom -s /bin/bash truonglangquan
 echo "truonglangquan:$PASS" | chpasswd
 
@@ -195,8 +196,8 @@ EOF
 # 7. Unmount & Cleanup
 echo "[7/8] Cleaning up and Unmounting..."
 sync
-swapoff $MNT/swap/swapfile || true
-umount -R $MNT || true
+swapoff "$MNT/swap/swapfile" || true
+umount -R "$MNT" || true
 
 echo "========================================="
 echo "✅ Installation Complete!"
