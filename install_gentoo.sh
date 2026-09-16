@@ -18,8 +18,22 @@ echo "🚀 Starting Gentoo Installation"
 echo "[0/8] Verifying Network Connection..."
 ping -c 3 distfiles.gentoo.org || { echo "ERROR: No network! Please connect to the internet first."; exit 1; }
 
-echo "[0.1/8] Password check"
-USER_PASS="${USER_PASS:?Set USER_PASS env var before running, e.g. USER_PASS='...' $0}"
+echo "[0.1/8] Password setup"
+if [ -z "$USER_PASS" ]; then
+    read -rsp "Enter password for root, tlquan, and truonglangquan: " USER_PASS
+    echo
+    read -rsp "Confirm password: " USER_PASS_CONFIRM
+    echo
+    if [ "$USER_PASS" != "$USER_PASS_CONFIRM" ]; then
+        echo "ERROR: Passwords do not match!"
+        exit 1
+    fi
+    if [ -z "$USER_PASS" ]; then
+        echo "ERROR: Password cannot be empty!"
+        exit 1
+    fi
+fi
+echo "✅ Password set."
 echo "========================================="
 
 # 1. Format and Create Subvolumes
