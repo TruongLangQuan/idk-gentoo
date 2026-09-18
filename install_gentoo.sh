@@ -8,6 +8,50 @@
 
 set -e
 
+explain_failure() {
+    local cmd="$1"
+    local code="$2"
+    case "$cmd" in
+        *ping*|*wget*|*curl*)
+            echo "Network or internet connectivity failure. Check your Wi-Fi or DNS settings." ;;
+        *mkfs.btrfs*)
+            echo "Failed to format partition to BTRFS. The disk/partition may be mounted, in use, or device node invalid." ;;
+        *mount*)
+            echo "Mount failed. Check if the partition exists, is already mounted, or filesystem is damaged." ;;
+        *btrfs\ subvolume*)
+            echo "BTRFS subvolume creation failed. Root partition may not be properly mounted." ;;
+        *mkswapfile*|*mkswap*|*swapon*)
+            echo "Swap creation or activation failed. Ensure sufficient disk space and valid BTRFS properties." ;;
+        *tar*)
+            echo "Stage3 tarball extraction failed. Download may be corrupt or disk may be full." ;;
+        *chroot*)
+            echo "Installation failed during chroot execution. Check the chroot error box above for specific details." ;;
+        *)
+            echo "Command exited with status code $code. Check the terminal output directly above for error messages." ;;
+    esac
+}
+
+error_handler() {
+    local exit_code=$?
+    local line_no=$1
+    local cmd=$2
+    trap - ERR
+    echo ""
+    echo "=========================================================="
+    echo "❌ GENTOO INSTALLATION FAILED!"
+    echo "=========================================================="
+    echo "📍 Failed at Script Line: $line_no"
+    echo "⚙️ Failed Command:       $cmd"
+    echo "🔢 Exit Status Code:     $exit_code"
+    echo "💡 Diagnostic Reason:    $(explain_failure "$cmd" "$exit_code")"
+    echo "=========================================================="
+    echo "⚠️ Please take a photo or screenshot of this failure box."
+    kill "$KEEPALIVE_PID" 2>/dev/null || true
+    exit "$exit_code"
+}
+
+trap 'error_handler $LINENO "$BASH_COMMAND"' ERR
+
 GENTOO_PART="/dev/nvme0n1p3"
 EFI_PART="/dev/nvme0n1p1"
 MNT="/mnt/gentoo"
@@ -151,6 +195,51 @@ env PASS="$USER_PASS" chroot "$MNT" /bin/bash << 'EOF'
 set -e
 source /etc/profile
 
+explain_chroot_failure() {
+    local cmd="$1"
+    local code="$2"
+    case "$cmd" in
+        *emerge-webrsync*|*emerge\ --sync*)
+            echo "Portage tree sync failed. Check Gentoo mirror or network status." ;;
+        *auto_emerge*|*emerge*)
+            echo "Package compilation or emerge failed. Check /var/tmp/portage/*/temp/build.log for the exact compiler error." ;;
+        *genkernel*)
+            echo "Zen kernel build failed. Check /var/log/genkernel.log or kernel configuration." ;;
+        *chpasswd*)
+            echo "Password configuration failed via chpasswd. Check if your password meets length/complexity requirements (e.g. at least 8 characters with mixed letters/numbers)." ;;
+        *sudoers*)
+            echo "Failed to write sudoers configuration. Check /etc/sudoers.d directory and permissions." ;;
+        *useradd*)
+            echo "Failed to create user account." ;;
+        *grub-install*)
+            echo "GRUB EFI installation failed. Check if /boot is properly mounted as FAT32 ESP." ;;
+        *grub-mkconfig*)
+            echo "GRUB config generation failed (/boot/grub/grub.cfg)." ;;
+        *)
+            echo "Command exited with status code $code." ;;
+    esac
+}
+
+chroot_error_handler() {
+    local exit_code=$?
+    local line_no=$1
+    local cmd=$2
+    trap - ERR
+    echo ""
+    echo "=========================================================="
+    echo "❌ CHROOT CONFIGURATION FAILED!"
+    echo "=========================================================="
+    echo "📍 Failed inside Gentoo at Line: $line_no"
+    echo "⚙️ Failed Command:              $cmd"
+    echo "🔢 Exit Status Code:            $exit_code"
+    echo "💡 Diagnostic Reason:           $(explain_chroot_failure "$cmd" "$exit_code")"
+    echo "=========================================================="
+    echo "⚠️ Please take a photo or screenshot of this failure box."
+    exit "$exit_code"
+}
+
+trap 'chroot_error_handler $LINENO "$BASH_COMMAND"' ERR
+
 # Write optimized make.conf
 cat << 'MAKE_CONF' > /etc/portage/make.conf
 COMMON_FLAGS="-march=tigerlake -O2 -pipe"
@@ -222,7 +311,11 @@ rc-update add alsasound boot
 echo "--> Setting up users"
 echo "root:$PASS" | chpasswd
 auto_emerge app-admin/sudo
+mkdir -p /etc/sudoers.d
+chmod 750 /etc/sudoers.d
 echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
+chmod 440 /etc/sudoers.d/wheel
+grep -q "includedir /etc/sudoers.d" /etc/sudoers 2>/dev/null || echo "@includedir /etc/sudoers.d" >> /etc/sudoers
 
 echo "--> Creating tlquan (Admin)"
 id -u tlquan &>/dev/null || useradd -m -G wheel -s /bin/bash tlquan
@@ -238,6 +331,7 @@ echo "--> Installing GRUB"
 mkdir -p /etc/portage/package.use
 echo "sys-boot/grub mount" >> /etc/portage/package.use/grub
 auto_emerge sys-boot/grub sys-boot/os-prober
+mkdir -p /etc/default
 echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
 if grep -q "^GRUB_CMDLINE_LINUX=" /etc/default/grub 2>/dev/null; then
     sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 rootflags=subvol=\/@"/' /etc/default/grub
