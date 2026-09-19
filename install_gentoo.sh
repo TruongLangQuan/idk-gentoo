@@ -164,6 +164,10 @@ nameserver 8.8.8.8
 nameserver 9.9.9.9
 RESOLV
 mount "$EFI_PART" "$MNT/boot"
+if [ -d /boot/grub/themes/minimal ]; then
+    mkdir -p "$MNT/boot/grub/themes/minimal"
+    cp -r /boot/grub/themes/minimal/* "$MNT/boot/grub/themes/minimal/" 2>/dev/null || true
+fi
 mount --types proc /proc "$MNT/proc"
 mount --rbind /sys "$MNT/sys"
 mount --make-rslave "$MNT/sys"
@@ -333,11 +337,29 @@ echo "sys-boot/grub mount" >> /etc/portage/package.use/grub
 auto_emerge sys-boot/grub sys-boot/os-prober
 mkdir -p /etc/default
 echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
+if [ -f /boot/grub/themes/minimal/theme.txt ]; then
+    echo 'GRUB_THEME="/boot/grub/themes/minimal/theme.txt"' >> /etc/default/grub
+fi
 if grep -q "^GRUB_CMDLINE_LINUX=" /etc/default/grub 2>/dev/null; then
     sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 rootflags=subvol=\/@"/' /etc/default/grub
 else
     echo 'GRUB_CMDLINE_LINUX="rootflags=subvol=/@"' >> /etc/default/grub
 fi
+
+# Add Artix boot entry so Gentoo GRUB can also boot Artix properly
+cat << 'ARTIX_EOF' > /etc/grub.d/09_artix
+#!/bin/sh
+cat << 'ARTIX_MENU'
+menuentry 'Artix Linux (Zen Kernel)' --class artix --class gnu-linux --class gnu --class os {
+    insmod part_gpt
+    insmod btrfs
+    search --no-floppy --fs-uuid --set=root 3b148427-4cb4-4749-b73b-1eabc3fbcbc5
+    linux /@/boot/vmlinuz-linux-zen root=UUID=3b148427-4cb4-4749-b73b-1eabc3fbcbc5 rw rootflags=subvol=@ loglevel=3 quiet i2c_hid.polling_mode=1 i2c_hid_acpi.polling_mode=1 psmouse.elantech_smbus=0
+    initrd /@/boot/intel-ucode.img /@/boot/initramfs-linux-zen.img
+}
+ARTIX_MENU
+ARTIX_EOF
+chmod 755 /etc/grub.d/09_artix
 
 grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=gentoo
 grub-mkconfig -o /boot/grub/grub.cfg
@@ -349,6 +371,15 @@ echo "[7/8] Cleaning up and Unmounting..."
 sync
 swapoff "$MNT/swap/swapfile" || true
 umount -R "$MNT" || true
+
+# Restore Artix as primary UEFI bootloader if present
+ARTIX_BOOT_NUM=$(efibootmgr 2>/dev/null | awk -F'[* ]+' '/Artix/ {sub(/^Boot/, "", $1); print $1; exit}')
+if [ -n "$ARTIX_BOOT_NUM" ]; then
+    CURRENT_ORDER=$(efibootmgr | awk -F': ' '/BootOrder/ {print $2}')
+    REMAINDER=$(echo "$CURRENT_ORDER" | tr ',' '\n' | grep -v "^${ARTIX_BOOT_NUM}$" | paste -sd ',' -)
+    efibootmgr -o "${ARTIX_BOOT_NUM},${REMAINDER}" 2>/dev/null || true
+    echo "Restored Artix as primary UEFI bootloader."
+fi
 
 echo "========================================="
 echo "✅ Installation Complete!"
