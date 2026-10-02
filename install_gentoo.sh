@@ -308,8 +308,40 @@ auto_emerge net-misc/networkmanager net-wireless/bluez media-video/pipewire medi
 # Enable services
 rc-update add dbus default
 rc-update add NetworkManager default
-rc-update add bluetooth default
 rc-update add alsasound boot
+
+# Low Memory Optimizations (<300MB idle target)
+echo "--> Applying Low Memory Optimizations (<300MB idle target)"
+sed -i 's/^rc_tty_number=.*/rc_tty_number=2/' /etc/rc.conf 2>/dev/null || echo 'rc_tty_number=2' >> /etc/rc.conf
+sed -i 's|^c[3-6]:2345:respawn:/sbin/agetty|#&|' /etc/inittab 2>/dev/null || true
+sed -i 's/^#children_max=.*/children_max=4/' /etc/udev/udev.conf 2>/dev/null || true
+
+mkdir -p /etc/sysctl.d
+cat << 'SYSCTL_EOF' > /etc/sysctl.d/99-low-ram.conf
+vm.vfs_cache_pressure = 300
+vm.dirty_background_ratio = 5
+vm.dirty_ratio = 10
+vm.swappiness = 100
+vm.page-cluster = 0
+vm.compaction_proactiveness = 0
+SYSCTL_EOF
+
+mkdir -p /etc/NetworkManager/conf.d
+cat << 'NM_EOF' > /etc/NetworkManager/conf.d/00-memory-optimizations.conf
+[main]
+plugins=keyfile
+modem-manager=false
+configure-and-quit=no
+rc-manager=resolvconf
+
+[logging]
+level=WARN
+
+[connectivity]
+enabled=false
+NM_EOF
+
+rm -f /stage3.tar.xz /stage3.tar.xz.DIGESTS
 
 # User Setup
 echo "--> Setting up users"
@@ -340,10 +372,11 @@ echo "GRUB_DISABLE_OS_PROBER=false" >> /etc/default/grub
 if [ -f /boot/grub/themes/minimal/theme.txt ]; then
     echo 'GRUB_THEME="/boot/grub/themes/minimal/theme.txt"' >> /etc/default/grub
 fi
+LOW_RAM_PARAMS="zswap.enabled=1 zswap.compressor=zstd zswap.zpool=zsmalloc zswap.max_pool_percent=25 nowatchdog"
 if grep -q "^GRUB_CMDLINE_LINUX=" /etc/default/grub 2>/dev/null; then
-    sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 rootflags=subvol=\/@"/' /etc/default/grub
+    sed -i "s/^GRUB_CMDLINE_LINUX=\"\(.*\)\"/GRUB_CMDLINE_LINUX=\"\1 rootflags=subvol=\/@ $LOW_RAM_PARAMS\"/" /etc/default/grub
 else
-    echo 'GRUB_CMDLINE_LINUX="rootflags=subvol=/@"' >> /etc/default/grub
+    echo "GRUB_CMDLINE_LINUX=\"rootflags=subvol=/@ $LOW_RAM_PARAMS\"" >> /etc/default/grub
 fi
 
 # Add Artix boot entry so Gentoo GRUB can also boot Artix properly
