@@ -10,7 +10,11 @@ if [ ! -d "$GENTOO_PATH" ]; then
     exit 1
 fi
 
+# Ensure the Gentoo partition has SUID permission active
+sudo mount -o remount,suid,dev /run/media/truonglangquan/69acd505-8329-45ec-8f6e-fe89373c4e5a 2>/dev/null || true
+
 cleanup() {
+    sudo umount -l "$GENTOO_PATH/home" 2>/dev/null || true
     sudo umount -l "$GENTOO_PATH/dev/pts" 2>/dev/null || true
     sudo umount -l "$GENTOO_PATH/dev/shm" 2>/dev/null || true
     sudo umount -l "$GENTOO_PATH/dev" 2>/dev/null || true
@@ -22,7 +26,7 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-echo "--> Setting up virtual filesystem mounts..."
+echo "--> Setting up mounts with SUID support..."
 sudo mount --bind /dev "$GENTOO_PATH/dev"
 sudo mount --bind /dev/pts "$GENTOO_PATH/dev/pts"
 sudo mount --bind /dev/shm "$GENTOO_PATH/dev/shm"
@@ -31,26 +35,30 @@ sudo mount --bind /sys "$GENTOO_PATH/sys"
 sudo mount --bind /run "$GENTOO_PATH/run"
 sudo mount --bind /tmp "$GENTOO_PATH/tmp"
 
-# Allow local X11 connections for GUI apps
+# Bind Gentoo's @home to /home in chroot so user home dirs exist
+if [ -d "/run/media/truonglangquan/69acd505-8329-45ec-8f6e-fe89373c4e5a/@home" ]; then
+    sudo mount --bind "/run/media/truonglangquan/69acd505-8329-45ec-8f6e-fe89373c4e5a/@home" "$GENTOO_PATH/home"
+fi
+
+# Allow local X11 connections
 xhost +local: >/dev/null 2>&1 || true
 
-echo "--> Entering Gentoo environment as user truonglangquan (with display forwarding)..."
+echo "--> Entering Gentoo environment..."
 if [ "$#" -gt 0 ]; then
-    sudo chroot "$GENTOO_PATH" su - truonglangquan -c "
+    sudo chroot "$GENTOO_PATH" /bin/bash -c "
         export WAYLAND_DISPLAY='$WAYLAND_DISPLAY'
         export DISPLAY='$DISPLAY'
         export XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR'
         export XDG_SESSION_TYPE='wayland'
-        export WLR_BACKENDS='wayland'
         $*
     "
 else
-    sudo chroot "$GENTOO_PATH" su - truonglangquan -c "
+    sudo chroot "$GENTOO_PATH" /bin/bash -c "
         export WAYLAND_DISPLAY='$WAYLAND_DISPLAY'
         export DISPLAY='$DISPLAY'
         export XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR'
         export XDG_SESSION_TYPE='wayland'
-        export WLR_BACKENDS='wayland'
+        cd /root
         exec /bin/bash
     "
 fi
