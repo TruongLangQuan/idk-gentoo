@@ -1,7 +1,6 @@
 #!/bin/bash
 set -e
 
-# Path to mounted Gentoo root
 GENTOO_PATH="/run/media/truonglangquan/69acd505-8329-45ec-8f6e-fe89373c4e5a/@"
 
 if [ ! -d "$GENTOO_PATH" ]; then
@@ -10,12 +9,14 @@ if [ ! -d "$GENTOO_PATH" ]; then
 fi
 
 if [ -z "$WAYLAND_DISPLAY" ]; then
-    echo "❌ Error: No Wayland compositor running on host."
-    echo "Please run this from your graphical desktop terminal."
+    echo "❌ Error: No host Wayland compositor running. Run this from within your graphical desktop terminal."
     exit 1
 fi
 
+sudo mount -o remount,suid,dev /run/media/truonglangquan/69acd505-8329-45ec-8f6e-fe89373c4e5a 2>/dev/null || true
+
 cleanup() {
+    sudo umount -l "$GENTOO_PATH/home" 2>/dev/null || true
     sudo umount -l "$GENTOO_PATH/dev/pts" 2>/dev/null || true
     sudo umount -l "$GENTOO_PATH/dev/shm" 2>/dev/null || true
     sudo umount -l "$GENTOO_PATH/dev" 2>/dev/null || true
@@ -27,7 +28,6 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-# Ensure core filesystems and sockets are bound
 sudo mount --bind /dev "$GENTOO_PATH/dev"
 sudo mount --bind /dev/pts "$GENTOO_PATH/dev/pts"
 sudo mount --bind /dev/shm "$GENTOO_PATH/dev/shm"
@@ -36,11 +36,14 @@ sudo mount --bind /sys "$GENTOO_PATH/sys"
 sudo mount --bind /run "$GENTOO_PATH/run"
 sudo mount --bind /tmp "$GENTOO_PATH/tmp"
 
-# Allow local access
+if [ -d "/run/media/truonglangquan/69acd505-8329-45ec-8f6e-fe89373c4e5a/@home" ]; then
+    sudo mount --bind "/run/media/truonglangquan/69acd505-8329-45ec-8f6e-fe89373c4e5a/@home" "$GENTOO_PATH/home"
+fi
+
 xhost +local: >/dev/null 2>&1 || true
 
-echo "--> Launching nested Gentoo Sway in a window..."
-sudo chroot "$GENTOO_PATH" su - truonglangquan -c "
+echo "--> Launching Gentoo Sway in a nested window on your Artix desktop..."
+sudo chroot "$GENTOO_PATH" su - tlquan -c "
     export WAYLAND_DISPLAY='$WAYLAND_DISPLAY'
     export DISPLAY='$DISPLAY'
     export XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR'
